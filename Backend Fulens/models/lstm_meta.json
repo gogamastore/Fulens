@@ -1,0 +1,24 @@
+{
+  "model_type": "LSTM-PyTorch",
+  "trained_at": "2026-06-14T15:20:08.654960",
+  "metrics": {
+    "validation": {
+      "accuracy": 0,
+      "note": "Val sequence kosong (data kurang)"
+    },
+    "test": {
+      "accuracy": 0,
+      "note": "Test sequence kosong (data kurang)"
+    }
+  },
+  "architecture": {
+    "input_size": 104,
+    "hidden_sizes": [
+      128,
+      64,
+      32
+    ],
+    "dropout": 0.2,
+    "lookback": 90
+  }
+}

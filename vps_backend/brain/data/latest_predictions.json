@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-06-14T15:20:16.791959",
+  "current_price": 4215.0,
+  "trading_signal": {
+    "signal": "JUAL",
+    "score": -2.0,
+    "confidence": 40.0,
+    "reasoning": [
+      "\u2796 Prediksi 1 hari: -0.50% (Netral)",
+      "\u2705 LSTM & XGBoost sepakat arah",
+      "\u274c Prediksi 7 hari: -3.50% (Bearish)",
+      "\u274c Prediksi 30 hari: -10.49% (Bearish jangka menengah)"
+    ]
+  },
+  "predictions": {
+    "1": {
+      "horizon_days": 1,
+      "predicted_price": 4193.93,
+      "lower_bound": 4193.93,
+      "upper_bound": 4193.93,
+      "change_usd": -21.07,
+      "change_pct": -0.5,
+      "signal": "JUAL",
+      "date": "2026-06-15",
+      "xgb_price": 4193.93,
+      "lstm_price": 4193.93,
+      "model_agreement": true
+    },
+    "3": {
+      "horizon_days": 3,
+      "predicted_price": 4151.77,
+      "lower_bound": 4151.77,
+      "upper_bound": 4151.77,
+      "change_usd": -63.23,
+      "change_pct": -1.5,
+      "signal": "JUAL",
+      "date": "2026-06-17",
+      "xgb_price": 4151.77,
+      "lstm_price": 4151.77,
+      "model_agreement": true
+    },
+    "7": {
+      "horizon_days": 7,
+      "predicted_price": 4067.47,
+      "lower_bound": 4067.47,
+      "upper_bound": 4067.47,
+      "change_usd": -147.53,
+      "change_pct": -3.5,
+      "signal": "JUAL",
+      "date": "2026-06-21",
+      "xgb_price": 4067.47,
+      "lstm_price": 4067.47,
+      "model_agreement": true
+    },
+    "14": {
+      "horizon_days": 14,
+      "predicted_price": 3919.95,
+      "lower_bound": 3919.95,
+      "upper_bound": 3919.95,
+      "change_usd": -295.05,
+      "change_pct": -7.0,
+      "signal": "JUAL",
+      "date": "2026-06-28",
+      "xgb_price": 3919.95,
+      "lstm_price": 3919.95,
+      "model_agreement": true
+    },
+    "30": {
+      "horizon_days": 30,
+      "predicted_price": 3772.82,
+      "lower_bound": 3566.92,
+      "upper_bound": 3978.72,
+      "change_usd": -442.18,
+      "change_pct": -10.49,
+      "signal": "JUAL",
+      "date": "2026-07-14",
+      "xgb_price": 3898.88,
+      "lstm_price": 3688.78,
+      "model_agreement": true
+    }
+  }
+}
