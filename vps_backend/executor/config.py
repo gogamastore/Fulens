@@ -33,13 +33,25 @@ class BotSettings(BaseModel):
     close_on_neutral: bool = True     # tutup posisi saat FuLens berubah NETRAL
     close_on_flip: bool = True        # tutup posisi lama saat arah FuLens berbalik
 
-    # Entry bertahap (pyramiding ke arah profit) per simbol:
-    #  • entry-1 saat sinyal valid;
-    #  • entry ke-k ditambah HANYA jika harga sudah bergerak menguntungkan
-    #    ≥ (k-1) × add_step_atr × ATR dari entry pertama (menambah ke posisi
-    #    yang terbukti benar, bukan averaging-down).
+    # Entry bertahap per simbol (scaling untuk memperbaiki harga rata-rata):
+    #  • entry-1 saat sinyal valid + timing stochastic terpenuhi;
+    #  • entry ke-k ditambah saat harga bergerak MELAWAN ≥ (k-1)×add_step_atr×ATR
+    #    dari entry pertama (SELL: harga naik; BUY: harga turun) — memperbaiki
+    #    harga rata-rata. TP entry tambahan mengikuti struktur (support/resistance).
     max_positions_per_symbol: int = 1  # jumlah entry maksimum per simbol
     add_step_atr: float = 0.5          # jarak (×ATR) antar entry bertahap
+    # TP entry tambahan MENGECIL tiap entry: entry-1 = tp_atr_mult (2.5),
+    # entry-2 = 2.0, entry-3 = 1.5, ... dibatasi min_tp_atr_mult.
+    tp_step_atr: float = 0.5
+    min_tp_atr_mult: float = 0.5
+
+    # ── Timing entry via Stochastic (HANYA timeframe M15) ────────────
+    # Di M15: walau sinyal valid, bot MENUNGGU momen —
+    #   SELL → %K ≥ stoch_upper (overbought); BUY → %K ≤ stoch_lower (oversold).
+    # Timeframe lain: entry mengikuti sinyal saja (tanpa gerbang stochastic).
+    entry_timing_enabled: bool = True
+    stoch_upper: float = 80.0
+    stoch_lower: float = 20.0
 
     # ── Risk management (mekanika eksekusi, bukan keputusan) ─────────
     risk_percent: float = 0.5     # % equity yang dirisikokan per entry

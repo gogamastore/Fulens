@@ -39,7 +39,10 @@ class RiskManager:
         self.day_start_equity = acc.get("equity") if acc else None
 
     def build_plan(self, symbol: str, direction: str, atr: float,
-                   risk_percent: float | None = None) -> TradePlan | None:
+                   risk_percent: float | None = None,
+                   tp_mult: float | None = None) -> TradePlan | None:
+        """SL = sl_atr_mult × ATR. TP = (tp_mult atau tp_atr_mult) × ATR.
+        `tp_mult` dipakai untuk entry tambahan yang TP-nya mengecil bertahap."""
         info = self.mt5.symbol_info(symbol)
         price = self.mt5.current_price(symbol)
         acc = self.mt5.account_info()
@@ -49,7 +52,7 @@ class RiskManager:
         entry = ask if direction == "BUY" else bid
 
         sl_dist = atr * self.s.sl_atr_mult
-        tp_dist = atr * self.s.tp_atr_mult
+        tp_dist = atr * (self.s.tp_atr_mult if tp_mult is None else tp_mult)
         if direction == "BUY":
             sl, tp = entry - sl_dist, entry + tp_dist
         else:

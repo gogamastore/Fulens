@@ -106,12 +106,15 @@ class BotEngine:
         if decision is None:
             return  # otak tak terjangkau / simbol di luar cakupan FuLens
 
-        # ATR dari MT5 hanya untuk mekanika lot & SL/TP (bukan keputusan arah).
-        df = self.mt5.get_rates(symbol, self.s.atr_timeframe)
-        if df is None or len(df) < self.s.atr_period + 2:
+        # Rate pada TIMEFRAME SINYAL: sumber ATR (SL/TP & lot), timing stochastic,
+        # dan struktur (support/resistance). Semua mekanika eksekusi, bukan arah.
+        df = self.mt5.get_rates(symbol, self.s.signal_timeframe)
+        need_bars = max(self.s.atr_period, 20) + 5
+        if df is None or len(df) < need_bars:
             return
         df = enrich(df, self.s.atr_period)
         atr = float(df["atr"].iloc[-1])
+        stoch_k = float(df["stoch_k"].iloc[-1])
         atr_map[symbol] = atr
 
         sym_pos = [p for p in all_pos if p["symbol"] == symbol]
@@ -124,7 +127,7 @@ class BotEngine:
 
         rec = decision.to_dict()
         rec.update(mode="fulens", executed=False, executed_entries=0,
-                   planned_entries=0, atr=atr)
+                   planned_entries=0, atr=atr, stoch_k=round(stoch_k, 2))
 
         closed = 0
         # 1) NETRAL → tutup semua posisi simbol ini (jika diaktifkan).
@@ -142,31 +145,51 @@ class BotEngine:
             closed += self._close_all(opposite, f"FuLens balik arah → {target}")
         rec["closed_positions"] = closed
 
-        # 3) Entry bertahap searah (pyramiding ke arah profit).
-        #    Maksimal SATU entry per siklus agar benar-benar bertahap.
+        # 3) Timing entry (price action / Stochastic) — HANYA di timeframe M15.
+        #    SELL tunggu overbought (%K ≥ atas); BUY tunggu oversold (%K ≤ bawah).
+        #    Timeframe lain: entry mengikuti sinyal saja (tanpa gerbang ini).
+        timing_ok = True
+        if self.s.entry_timing_enabled and self.s.signal_timeframe == "M15":
+            timing_ok = (stoch_k >= self.s.stoch_upper if target == "SELL"
+                         else stoch_k <= self.s.stoch_lower)
+
+        # 4) Entry bertahap (scaling untuk perbaiki harga rata-rata). Maks 1/siklus.
         same_dir = [p for p in sym_pos if p["type"] == target]
         m = len(same_dir)
         total_open = len(all_pos) - closed
+        # Entry bertahap (scaling) HANYA di M15; timeframe lain maksimal 1 entry
+        # (entry polos mengikuti sinyal, seperti sebelumnya).
+        max_entries = (self.s.max_positions_per_symbol
+                       if self.s.signal_timeframe == "M15" else 1)
 
         allow_add = (
-            actionable
-            and m < self.s.max_positions_per_symbol
+            actionable and timing_ok
+            and m < max_entries
             and total_open < self.s.max_open_positions
         )
-        # Entry ke-2 dst hanya jika harga sudah bergerak MENGUNTUNGKAN
-        # ≥ m × add_step_atr × ATR dari entry pertama (bukan averaging-down).
+        # Entry ke-2 dst: harga sudah bergerak MELAWAN ≥ m × add_step_atr × ATR
+        # dari entry pertama (SELL: harga naik; BUY: harga turun).
         if allow_add and m >= 1 and atr > 0:
             anchor = min(same_dir, key=lambda p: p["time"])
             cur = same_dir[0]["price_current"]
-            fav = (cur - anchor["price_open"]) if target == "BUY" \
+            adverse = (cur - anchor["price_open"]) if target == "SELL" \
                 else (anchor["price_open"] - cur)
-            if fav < m * self.s.add_step_atr * atr:
+            if adverse < m * self.s.add_step_atr * atr:
                 allow_add = False
 
         rec["planned_entries"] = 1 if allow_add else 0
+        if actionable and not timing_ok:
+            thr = self.s.stoch_upper if target == "SELL" else self.s.stoch_lower
+            op = "≥" if target == "SELL" else "≤"
+            rec["timing_wait"] = f"menunggu Stoch %K {op} {thr} (kini {stoch_k:.1f})"
 
         if allow_add:
-            plan = self.risk.build_plan(symbol, target, atr, self.s.risk_percent)
+            # TP mengecil tiap entry tambahan: entry-1 = tp_atr_mult (2.5),
+            # entry-2 = 2.0, entry-3 = 1.5, ... dibatasi min_tp_atr_mult.
+            tp_mult = max(self.s.tp_atr_mult - m * self.s.tp_step_atr,
+                          self.s.min_tp_atr_mult)
+            plan = self.risk.build_plan(symbol, target, atr, self.s.risk_percent,
+                                        tp_mult=tp_mult)
             if plan and plan.volume > 0:
                 acc = self.mt5.account_info()
                 need = self.mt5.order_margin(symbol, target, plan.volume)
@@ -182,7 +205,7 @@ class BotEngine:
                             "symbol": symbol, "direction": target, "mode": "fulens",
                             "volume": plan.volume, "sl": plan.sl, "tp": plan.tp,
                             "confidence": decision.confidence,
-                            "entry": f"{m + 1}/{self.s.max_positions_per_symbol}",
+                            "entry": f"{m + 1}/{max_entries}",
                             "reasons": decision.reasons,
                         })
                 else:
