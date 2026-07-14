@@ -34,6 +34,7 @@ import symbols
 import timeframes
 import signal_engine
 import backtest_engine
+import market_data
 import ml_symbol
 from fastapi import BackgroundTasks
 
@@ -138,6 +139,57 @@ def load_models():
             print(f"⚠ LSTM load error: {e}")
 
 
+def _merge_live_gold_d1(df: pd.DataFrame) -> pd.DataFrame:
+    """Sisipkan bar D1 emas TERBARU (yfinance live) ke df dari CSV.
+
+    Emas+D1 memakai pipeline ML yang membaca `gold_processed.csv` statis — file itu
+    hanya diperbarui saat `python data_pipeline.py` dijalankan, sehingga harga/teknikal
+    D1 bisa tertinggal berhari-hari (mis. berhenti 12 Juni) padahal timeframe intraday
+    yang live sudah terkini. Di sini kita ambil bar D1 live lalu:
+      • perbarui bar terakhir yang sudah ada (candle hari berjalan bisa berubah), dan
+      • tambahkan bar baru setelah tanggal terakhir CSV.
+    Kolom fundamental (dxy/cpi/...) di baris baru di-ffill dari nilai terakhir agar
+    fitur ML tetap terbentuk. Bila apa pun gagal, kembalikan df apa adanya (fallback
+    ke perilaku lama). HANYA menyentuh tanggal ≥ bar terakhir CSV → histori lama utuh.
+    """
+    try:
+        live = market_data.get_ohlc(symbols.DEFAULT, "D1")
+        if live is None or len(live) == 0:
+            return df
+        live = live.copy()
+        idx = pd.to_datetime(live.index)
+        try:
+            idx = idx.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+        live.index = idx.normalize()
+
+        df = df.copy()
+        gcols = ["gold_open", "gold_high", "gold_low", "gold_close", "gold_volume"]
+        others = [c for c in df.columns if c not in gcols]
+        cutoff = df.index.max()
+
+        for ts, row in live[live.index >= cutoff].iterrows():
+            if ts in df.index:                       # perbarui bar terakhir
+                for c in gcols:
+                    if c in df.columns and c in live.columns and not pd.isna(row[c]):
+                        df.at[ts, c] = float(row[c])
+            else:                                    # tambah bar baru
+                new_row = {c: np.nan for c in df.columns}
+                for c in gcols:
+                    if c in live.columns and not pd.isna(row[c]):
+                        new_row[c] = float(row[c])
+                df.loc[ts] = new_row
+
+        df = df.sort_index()
+        if others:
+            df[others] = df[others].ffill()          # fundamental ikut nilai terakhir
+        return df
+    except Exception as e:
+        print(f"⚠ Refresh bar D1 emas gagal (pakai CSV): {e}")
+        return df
+
+
 def load_data_cache():
     """Load dan cache data + features."""
     now = datetime.now()
@@ -145,6 +197,7 @@ def load_data_cache():
         (now - _cache["last_update"]).seconds > CACHE_TTL):
         try:
             df = load_processed_data()
+            df = _merge_live_gold_d1(df)          # jaga bar D1 tetap terkini
             df_feat = build_feature_set(df)
             _cache["df"]          = df
             _cache["df_features"] = df_feat

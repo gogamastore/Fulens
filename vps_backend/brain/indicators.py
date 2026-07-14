@@ -332,8 +332,12 @@ class TechnicalAnalyzer:
             else:
                 if val == c.iloc[i-window:i+window].max() and val > cp:
                     levels.append(round(val, 2))
-        # Deduplikasi & ambil n terdekat
-        levels = sorted(set(levels), reverse=(mode=="resistance"))
+        # Ambil n level TERDEKAT ke harga sekarang (bukan swing paling ekstrem):
+        #  • support   → nilai TERBESAR di bawah harga  → urut MENURUN, ambil n.
+        #  • resistance → nilai TERKECIL di atas harga    → urut MENAIK, ambil n.
+        # (Sebelumnya arah sort terbalik sehingga selalu memilih swing high/low
+        #  2 tahun terjauh — mis. resistance 5200 / support 2565 saat harga 4215.)
+        levels = sorted(set(levels), reverse=(mode == "support"))
         return levels[:n]
 
     def get_dataframe(self) -> pd.DataFrame:

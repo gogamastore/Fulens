@@ -113,9 +113,21 @@ class BotEngine:
         if df is None or len(df) < need_bars:
             return
         df = enrich(df, self.s.atr_period)
-        atr = float(df["atr"].iloc[-1])
-        stoch_k = float(df["stoch_k"].iloc[-1])
-        atr_map[symbol] = atr
+        atr = float(df["atr"].iloc[-1])          # ATR timeframe sinyal → dipakai untuk
+        stoch_k = float(df["stoch_k"].iloc[-1])  # timing stochastic & jarak scaling entry.
+
+        # ATR untuk JARAK SL/TP (+trailing) diambil dari `atr_timeframe` (mis. H1),
+        # BUKAN dari signal_timeframe. Ini mencegah SL/TP melebar liar saat sinyal
+        # dihitung pada timeframe tinggi: ATR D1 XAUUSD ~$90 → SL 1.5×ATR ≈ $139.
+        # ATR H1 jauh lebih rapat sehingga SL/TP proporsional & margin-aware.
+        atr_risk = atr
+        risk_tf = self.s.atr_timeframe
+        if risk_tf and risk_tf != self.s.signal_timeframe:
+            dfr = self.mt5.get_rates(symbol, risk_tf)
+            if dfr is not None and len(dfr) >= need_bars:
+                dfr = enrich(dfr, self.s.atr_period)
+                atr_risk = float(dfr["atr"].iloc[-1])
+        atr_map[symbol] = atr_risk  # trailing stop ikut ATR risiko (selaras SL/TP)
 
         sym_pos = [p for p in all_pos if p["symbol"] == symbol]
         target = decision.direction  # "BUY" / "SELL" / None
@@ -127,7 +139,7 @@ class BotEngine:
 
         rec = decision.to_dict()
         rec.update(mode="fulens", executed=False, executed_entries=0,
-                   planned_entries=0, atr=atr, stoch_k=round(stoch_k, 2))
+                   planned_entries=0, atr=atr_risk, stoch_k=round(stoch_k, 2))
 
         closed = 0
         # 1) NETRAL → tutup semua posisi simbol ini (jika diaktifkan).
@@ -188,7 +200,7 @@ class BotEngine:
             # entry-2 = 2.0, entry-3 = 1.5, ... dibatasi min_tp_atr_mult.
             tp_mult = max(self.s.tp_atr_mult - m * self.s.tp_step_atr,
                           self.s.min_tp_atr_mult)
-            plan = self.risk.build_plan(symbol, target, atr, self.s.risk_percent,
+            plan = self.risk.build_plan(symbol, target, atr_risk, self.s.risk_percent,
                                         tp_mult=tp_mult)
             if plan and plan.volume > 0:
                 acc = self.mt5.account_info()

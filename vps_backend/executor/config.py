@@ -77,7 +77,12 @@ class FulensConfig:
     """Koneksi INTERNAL ke otak FuLens (jalan di localhost VPS, port 8500)."""
     BASE_URL = "http://127.0.0.1:8500"   # samakan dgn API_HOST/API_PORT FuLens
     API_KEY: str | None = None            # FuLens internal belum pakai key
-    TIMEOUT = 8.0                         # detik
+    # Timeout proxy ke brain. Endpoint intraday (M15/M30/H1/H4/W1) mengunduh
+    # data live dari Yahoo Finance saat cache dingin — ini bisa >8 dtk, apalagi
+    # ketika ganti timeframe memicu beberapa request serentak. 8 dtk terlalu
+    # pendek → httpx timeout → proxy balas 502. Beri ruang connect cepat tapi
+    # read yang lega. (Pastikan timeout Flutter > nilai ini; lihat theme.dart.)
+    TIMEOUT = 30.0                        # detik (read); dipakai sbg httpx timeout
     # Override pemetaan simbol broker → simbol kanonik FuLens.
     # Umumnya tak perlu: FuLens (symbols.normalize) sudah mengenali nama broker
     # standar & suffix umum. Isi di sini HANYA jika broker Anda pakai nama unik,
@@ -88,7 +93,7 @@ class FulensConfig:
 class ServerConfig:
     # Bind ke IP interface VPS (mis. Tailscale). Sebagian Windows Server menolak
     # "0.0.0.0" dengan error `getaddrinfo failed` — pakai IP spesifik agar aman.
-    HOST = "100.78.56.14"
+    HOST = "93.127.140.99"
     PORT = 8000                                          # gerbang tunggal utk Flutter
     API_KEY = "CN9-5UB1TBJMD5wM_WR5dNiPr_Gbq9CXz6dt8Pa1spg"  # wajib diganti sebelum publik!
 

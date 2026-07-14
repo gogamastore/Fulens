@@ -7,7 +7,7 @@
 class AppConfig {
   // Ganti dengan IP/host VPS Windows tempat backend berjalan.
   // Contoh: '100.78.56.14:8000' (Tailscale) atau 'localhost:8000' saat lokal.
-  static const String host = '100.78.56.14:8000';
+  static const String host = '93.127.140.99:8000';
 
   // WAJIB sama dengan ServerConfig.API_KEY di 'backend eksekutor/config.py'.
   static const String apiKey = 'CN9-5UB1TBJMD5wM_WR5dNiPr_Gbq9CXz6dt8Pa1spg';

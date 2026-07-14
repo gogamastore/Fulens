@@ -6,6 +6,7 @@ mengunduh data per simbol + timeframe lalu menamai ulang kolomnya menjadi
 dipakai lintas simbol & timeframe tanpa perubahan.
 """
 import logging
+import threading
 import time
 import warnings
 
@@ -20,6 +21,22 @@ log = logging.getLogger("market_data")
 
 _CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
 _TTL = 300  # detik
+
+# Kunci per-key: mencegah "thundering herd". Saat ganti timeframe, Flutter
+# menembak signal/history/indicators/price/multitimeframe serentak — semuanya
+# cache-miss untuk (simbol, tf) yang SAMA. Tanpa kunci, tiap request mengunduh
+# sendiri dari Yahoo secara paralel → throttling → semua lambat/timeout (502).
+# Dengan kunci: request pertama mengunduh, sisanya menunggu lalu ambil dari cache.
+_LOCKS: dict[tuple, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(key: tuple) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = _LOCKS[key] = threading.Lock()
+        return lock
 
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
@@ -72,26 +89,34 @@ def get_ohlc(symbol: str, timeframe: str = "D1",
     if hit and now - hit[0] < _TTL:
         return hit[1]
 
-    try:
-        kw = dict(interval=spec["interval"], auto_adjust=True, progress=False)
-        if start or end:
-            raw = yf.download(ticker, start=start, end=end, **kw)
-        else:
-            raw = yf.download(ticker, period=spec["period"], **kw)
-    except Exception as e:
-        log.warning("Gagal unduh %s (%s): %s", symbol, ticker, e)
-        return hit[1] if hit else None
+    # Hanya satu thread yang mengunduh (simbol, tf) ini pada satu waktu.
+    with _lock_for(key):
+        # Cek ulang: thread lain mungkin sudah mengisi cache saat kita menunggu.
+        now = time.time()
+        hit = _CACHE.get(key)
+        if hit and now - hit[0] < _TTL:
+            return hit[1]
 
-    if raw is None or len(raw) == 0:
-        log.warning("Data kosong untuk %s (%s)", symbol, ticker)
-        return hit[1] if hit else None
+        try:
+            kw = dict(interval=spec["interval"], auto_adjust=True, progress=False)
+            if start or end:
+                raw = yf.download(ticker, start=start, end=end, **kw)
+            else:
+                raw = yf.download(ticker, period=spec["period"], **kw)
+        except Exception as e:
+            log.warning("Gagal unduh %s (%s): %s", symbol, ticker, e)
+            return hit[1] if hit else None
 
-    df = _alias(raw)
-    if spec["resample"]:
-        df = _resample(df, spec["resample"])
+        if raw is None or len(raw) == 0:
+            log.warning("Data kosong untuk %s (%s)", symbol, ticker)
+            return hit[1] if hit else None
 
-    _CACHE[key] = (now, df)
-    return df
+        df = _alias(raw)
+        if spec["resample"]:
+            df = _resample(df, spec["resample"])
+
+        _CACHE[key] = (now, df)
+        return df
 
 
 def latest_price(symbol: str, timeframe: str = "D1") -> dict | None:

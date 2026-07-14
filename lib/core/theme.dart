@@ -88,7 +88,9 @@ class AppConstants {
   // static const String baseUrl = 'http://192.168.x.x:8000';  // HP fisik (ganti IP LAN)
 
   static const Duration cacheTimeout   = Duration(seconds: 60);
-  static const Duration requestTimeout = Duration(seconds: 15);
+  // Harus LEBIH BESAR dari FulensConfig.TIMEOUT di executor (30s), agar Flutter
+  // tidak menyerah sebelum proxy sempat mengembalikan hasil unduhan intraday.
+  static const Duration requestTimeout = Duration(seconds: 35);
 }
 
 // ── Helper Extensions ──
