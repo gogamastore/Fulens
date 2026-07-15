@@ -33,12 +33,23 @@ class BotSettings(BaseModel):
     close_on_neutral: bool = True     # tutup posisi saat FuLens berubah NETRAL
     close_on_flip: bool = True        # tutup posisi lama saat arah FuLens berbalik
 
-    # Entry bertahap per simbol (scaling untuk memperbaiki harga rata-rata):
-    #  • entry-1 saat sinyal valid + timing stochastic terpenuhi;
-    #  • entry ke-k ditambah saat harga bergerak MELAWAN ≥ (k-1)×add_step_atr×ATR
-    #    dari entry pertama (SELL: harga naik; BUY: harga turun) — memperbaiki
-    #    harga rata-rata. TP entry tambahan mengikuti struktur (support/resistance).
-    max_positions_per_symbol: int = 1  # jumlah entry maksimum per simbol
+    # ── Entry bertahap per simbol (scaling) ──────────────────────────
+    # Entry-1 selalu butuh sinyal valid + timing stochastic (M15). Entry ke-k
+    # ditambah saat harga sudah bergerak ≥ (k-1)×add_step_atr×ATR dari entry-1;
+    # ARAH gerakan yang dituntut tergantung `scaling_mode`:
+    #
+    #  • "pyramid"      → tambah saat posisi PROFIT (BUY: harga naik; SELL: turun).
+    #                     Menambah ke posisi yang sudah terbukti benar — risiko
+    #                     lebih terkendali karena entry baru lahir dari kemenangan.
+    #  • "average_down" → tambah saat harga MELAWAN (BUY: turun; SELL: naik).
+    #                     Memperbaiki harga rata-rata (DCA), TAPI menumpuk lot pada
+    #                     posisi rugi (gaya martingale) — drawdown bisa membesar
+    #                     cepat saat tren melawan terus. Ini perilaku lama.
+    #  • "off"          → hanya 1 entry per simbol (tanpa penambahan).
+    #
+    # Berlaku di SEMUA timeframe (dulu terkunci hanya M15).
+    scaling_mode: str = "pyramid"
+    max_positions_per_symbol: int = 3  # jumlah entry maksimum per simbol
     add_step_atr: float = 0.5          # jarak (×ATR) antar entry bertahap
     # TP entry tambahan MENGECIL tiap entry: entry-1 = tp_atr_mult (2.5),
     # entry-2 = 2.0, entry-3 = 1.5, ... dibatasi min_tp_atr_mult.
@@ -56,7 +67,18 @@ class BotSettings(BaseModel):
     # ── Risk management (mekanika eksekusi, bukan keputusan) ─────────
     risk_percent: float = 0.5     # % equity yang dirisikokan per entry
     atr_period: int = 14          # ATR dihitung dari rate MT5 untuk jarak SL/TP
-    atr_timeframe: str = "H1"     # timeframe ATR (selaras horizon sinyal FuLens)
+    # Timeframe sumber ATR untuk jarak SL/TP + trailing:
+    #  • "auto"  → IKUT timeframe yang dipilih pengguna di Flutter (signal_timeframe).
+    #              SL/TP menyesuaikan horizon trading: M15 rapat, D1 lebar.
+    #  • "M30"/"H1"/... → PIN ke satu timeframe, apa pun pilihan pengguna.
+    #
+    # Soal "auto" di D1: ATR emas D1 ~$90 → SL 1.5×ATR ≈ $139. Itu WAJAR untuk swing
+    # D1 (butuh ruang napas) dan risiko TIDAK ikut membesar: lot dihitung dari
+    # sl_dist (lihat risk_manager.build_plan), jadi SL lebar → lot kecil → kerugian
+    # tetap risk_percent (0.5%) dari equity. Yang berubah cuma jarak, bukan risiko.
+    # Pin ke "M30"/"H1" HANYA jika ingin SL selalu rapat berapa pun timeframe-nya
+    # (konsekuensi: di sinyal D1, SL rapat lebih gampang kena noise → sering stop-out).
+    atr_timeframe: str = "auto"
     sl_atr_mult: float = 1.5      # SL = 1.5 x ATR
     tp_atr_mult: float = 2.5      # TP = 2.5 x ATR
     trailing_enabled: bool = True

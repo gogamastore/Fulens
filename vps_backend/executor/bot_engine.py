@@ -106,8 +106,9 @@ class BotEngine:
         if decision is None:
             return  # otak tak terjangkau / simbol di luar cakupan FuLens
 
-        # Rate pada TIMEFRAME SINYAL: sumber ATR (SL/TP & lot), timing stochastic,
-        # dan struktur (support/resistance). Semua mekanika eksekusi, bukan arah.
+        # Rate pada TIMEFRAME SINYAL: sumber timing stochastic + jarak scaling entry.
+        # (Jarak SL/TP TIDAK dari sini — lihat atr_risk di bawah.) Mekanika eksekusi,
+        # bukan penentu arah.
         df = self.mt5.get_rates(symbol, self.s.signal_timeframe)
         need_bars = max(self.s.atr_period, 20) + 5
         if df is None or len(df) < need_bars:
@@ -116,12 +117,15 @@ class BotEngine:
         atr = float(df["atr"].iloc[-1])          # ATR timeframe sinyal → dipakai untuk
         stoch_k = float(df["stoch_k"].iloc[-1])  # timing stochastic & jarak scaling entry.
 
-        # ATR untuk JARAK SL/TP (+trailing) diambil dari `atr_timeframe` (mis. H1),
-        # BUKAN dari signal_timeframe. Ini mencegah SL/TP melebar liar saat sinyal
-        # dihitung pada timeframe tinggi: ATR D1 XAUUSD ~$90 → SL 1.5×ATR ≈ $139.
-        # ATR H1 jauh lebih rapat sehingga SL/TP proporsional & margin-aware.
+        # ATR untuk JARAK SL/TP (+trailing), sumbernya diatur `atr_timeframe`:
+        #  • "auto" → ikut timeframe pilihan pengguna di Flutter (signal_timeframe),
+        #             sehingga SL/TP menyesuaikan horizon trading yang sedang dipakai.
+        #  • nilai eksplisit (mis. "M30"/"H1") → di-PIN, tak ikut pilihan pengguna.
+        # Saat sama dengan signal_timeframe, pakai ulang `atr` — tak perlu fetch lagi.
         atr_risk = atr
-        risk_tf = self.s.atr_timeframe
+        risk_tf = (self.s.atr_timeframe or "auto").strip()
+        if risk_tf.lower() in ("auto", "signal", "ikut"):
+            risk_tf = self.s.signal_timeframe
         if risk_tf and risk_tf != self.s.signal_timeframe:
             dfr = self.mt5.get_rates(symbol, risk_tf)
             if dfr is not None and len(dfr) >= need_bars:
@@ -157,37 +161,47 @@ class BotEngine:
             closed += self._close_all(opposite, f"FuLens balik arah → {target}")
         rec["closed_positions"] = closed
 
-        # 3) Timing entry (price action / Stochastic) — HANYA di timeframe M15.
+        same_dir = [p for p in sym_pos if p["type"] == target]
+        m = len(same_dir)  # jumlah entry searah yang sudah terbuka
+        total_open = len(all_pos) - closed
+
+        # 3) Timing entry (Stochastic) — HANYA di M15 dan HANYA untuk entry PERTAMA.
         #    SELL tunggu overbought (%K ≥ atas); BUY tunggu oversold (%K ≤ bawah).
-        #    Timeframe lain: entry mengikuti sinyal saja (tanpa gerbang ini).
+        #    Entry tambahan TIDAK ikut gerbang ini: ia punya gerbang sendiri (jarak
+        #    ATR di bawah). Kalau ikut, mode "pyramid" mustahil tereksekusi — BUY
+        #    menuntut %K ≤ 20 padahal pyramiding menambah justru saat harga naik
+        #    (%K tinggi). Timeframe lain: entry mengikuti sinyal saja.
         timing_ok = True
-        if self.s.entry_timing_enabled and self.s.signal_timeframe == "M15":
+        if (self.s.entry_timing_enabled and self.s.signal_timeframe == "M15"
+                and m == 0):
             timing_ok = (stoch_k >= self.s.stoch_upper if target == "SELL"
                          else stoch_k <= self.s.stoch_lower)
 
-        # 4) Entry bertahap (scaling untuk perbaiki harga rata-rata). Maks 1/siklus.
-        same_dir = [p for p in sym_pos if p["type"] == target]
-        m = len(same_dir)
-        total_open = len(all_pos) - closed
-        # Entry bertahap (scaling) HANYA di M15; timeframe lain maksimal 1 entry
-        # (entry polos mengikuti sinyal, seperti sebelumnya).
+        # 4) Entry bertahap (scaling). Maks 1 entry per siklus.
         max_entries = (self.s.max_positions_per_symbol
-                       if self.s.signal_timeframe == "M15" else 1)
+                       if self.s.scaling_mode != "off" else 1)
 
         allow_add = (
             actionable and timing_ok
             and m < max_entries
             and total_open < self.s.max_open_positions
         )
-        # Entry ke-2 dst: harga sudah bergerak MELAWAN ≥ m × add_step_atr × ATR
-        # dari entry pertama (SELL: harga naik; BUY: harga turun).
+        # Entry ke-2 dst: harga harus sudah bergerak ≥ m × add_step_atr × ATR dari
+        # entry PERTAMA. Arah yang dituntut tergantung scaling_mode:
+        #   • pyramid      → gerakan SEARAH profit (BUY: naik, SELL: turun).
+        #   • average_down → gerakan MELAWAN posisi (BUY: turun, SELL: naik).
         if allow_add and m >= 1 and atr > 0:
             anchor = min(same_dir, key=lambda p: p["time"])
             cur = same_dir[0]["price_current"]
-            adverse = (cur - anchor["price_open"]) if target == "SELL" \
-                else (anchor["price_open"] - cur)
-            if adverse < m * self.s.add_step_atr * atr:
+            favor = (cur - anchor["price_open"]) if target == "BUY" \
+                else (anchor["price_open"] - cur)   # >0 = profit, <0 = melawan
+            moved = favor if self.s.scaling_mode == "pyramid" else -favor
+            need = m * self.s.add_step_atr * atr
+            if moved < need:
                 allow_add = False
+            else:
+                rec["scaling"] = (f"{self.s.scaling_mode} e{m + 1}: gerak "
+                                  f"{moved:.2f} ≥ {need:.2f} ({m * self.s.add_step_atr}×ATR)")
 
         rec["planned_entries"] = 1 if allow_add else 0
         if actionable and not timing_ok:
