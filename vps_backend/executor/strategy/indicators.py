@@ -47,7 +47,8 @@ def efficiency_ratio(close: pd.Series, period: int = 20) -> float:
     return net / path if path > 0 else 0.0
 
 
-def enrich(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
+def enrich(df: pd.DataFrame, atr_period: int = 14,
+           vol_period: int = 20) -> pd.DataFrame:
     """Tambahkan semua indikator ke DataFrame OHLC."""
     out = df.copy()
     out["ema50"] = ema(out["close"], 50)
@@ -56,4 +57,9 @@ def enrich(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     out["macd"], out["macd_signal"], out["macd_hist"] = macd(out["close"])
     out["atr"] = atr(out, atr_period)
     out["stoch_k"], out["stoch_d"] = stochastic(out)
+    # Rata-rata volume utk gerbang partisipasi mode scalping. Rate MT5 memberi
+    # `tick_volume` (jumlah tick) — bukan volume riil, tapi proksi aktivitas yang
+    # sah untuk gold/forex, di mana `real_volume` broker retail umumnya 0.
+    if "tick_volume" in out.columns:
+        out["vol_ma"] = out["tick_volume"].rolling(vol_period).mean()
     return out

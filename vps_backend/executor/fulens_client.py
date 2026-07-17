@@ -26,6 +26,10 @@ class SignalDecision:
     raw_signal: str                # teks asli FuLens (mis. "BELI KUAT")
     price: float = 0.0
     reasons: list[str] = field(default_factory=list)
+    # Level struktur dari otak (dihitung pada timeframe sinyal). Dipakai gerbang
+    # scalping untuk menilai LOKASI entry — mis. menolak BUY yang mepet resisten.
+    support: list[float] = field(default_factory=list)
+    resistance: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -33,6 +37,7 @@ class SignalDecision:
             "confidence": self.confidence, "strong": self.strong,
             "raw_signal": self.raw_signal, "price": self.price,
             "reasons": self.reasons, "source": "fulens",
+            "support": self.support, "resistance": self.resistance,
         }
 
 
@@ -66,7 +71,8 @@ def fetch_signal(symbol: str, timeframe: str = "D1") -> SignalDecision | None:
             r.raise_for_status()
             data = r.json()
     except Exception as e:
-        log.warning("Gagal ambil sinyal FuLens (%s): %s", symbol, e)
+        log.warning("Gagal ambil sinyal FuLens (%s) → %s",
+                    symbol, f"{type(e).__name__}: {e}".rstrip(": "))
         return None
 
     direction, strong = _map_signal(data.get("signal", "NETRAL"))
@@ -82,11 +88,18 @@ def fetch_signal(symbol: str, timeframe: str = "D1") -> SignalDecision | None:
         reasons.append(f"Indikator FuLens — beli {summ.get('buy', 0)} / "
                        f"jual {summ.get('sell', 0)} / netral {summ.get('neutral', 0)}")
 
+    def _levels(key: str) -> list[float]:
+        try:
+            return [float(x) for x in (data.get(key) or [])]
+        except (TypeError, ValueError):
+            return []
+
     return SignalDecision(
         symbol=symbol, direction=direction,
         confidence=float(data.get("confidence", 0) or 0), strong=strong,
         raw_signal=data.get("signal", "NETRAL"),
         price=float(data.get("current_price", 0) or 0), reasons=reasons,
+        support=_levels("support"), resistance=_levels("resistance"),
     )
 
 
@@ -101,5 +114,9 @@ async def proxy_get(path: str, params: dict | None = None) -> tuple[int, object]
             body = r.json() if "application/json" in ct else {"raw": r.text}
             return r.status_code, body
     except Exception as e:
-        log.warning("Proxy FuLens gagal %s: %s", path, e)
-        return 502, {"detail": f"FuLens tidak dapat dihubungi: {e}"}
+        # Sertakan NAMA KELAS exception: httpx.ReadTimeout & kawan-kawan sering
+        # ber-str() kosong, sehingga log lama hanya berbunyi "gagal /api/v1/signal:"
+        # tanpa petunjuk apakah ini timeout, connect error, atau brain mati.
+        detail = f"{type(e).__name__}: {e}".rstrip(": ")
+        log.warning("Proxy FuLens gagal %s → %s", path, detail)
+        return 502, {"detail": f"FuLens tidak dapat dihubungi ({detail})"}

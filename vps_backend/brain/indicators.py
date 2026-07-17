@@ -319,26 +319,48 @@ class TechnicalAnalyzer:
 
         return report
 
-    def _find_levels(self, mode="support", n=3, window=20) -> list:
-        """Temukan level support/resistance dari pivot points."""
-        c  = self.close
-        cp = float(c.iloc[-1])
+    def _find_levels(self, mode="support", n=3, window=5, min_gap_pct=0.3) -> list:
+        """Level support/resistance dari swing pivot (fractal), n TERDEKAT ke harga.
+
+        Bar ke-i disebut swing low bila low[i] adalah nilai terendah di antara
+        `window` bar sebelum dan sesudahnya; swing high memakai high[i] sebaliknya.
+
+        Dua hal yang dulu salah dan menghasilkan level ngawur:
+         1. Sumbernya `close` dengan jendela ±20 bar. Pada tren naik kuat, low
+            pullback TIDAK pernah jadi minimum jendela 40 bar (harga 20 bar
+            sebelumnya lebih rendah), jadi yang lolos hanya titik AWAL tren →
+            support ratusan dolar jauhnya (mis. 3293 saat harga 4215). Resistance
+            tak kena efek ini, makanya dulu hanya support yang terlihat ngawur.
+            Jendela kecil (±5) pada high/low menangkap swing yang sebenarnya.
+         2. Arah sort terbalik → selalu mengambil swing paling ekstrem, bukan
+            terdekat (resistance 5200 / support 2565 saat harga 4215).
+
+        `min_gap_pct` menyaring level yang berdempetan agar n level yang keluar
+        benar-benar berbeda, bukan tiga pivot dari satu swing yang sama.
+        """
+        cp = float(self.close.iloc[-1])
+        vals = (self.low if mode == "support" else self.high).values
         levels = []
-        for i in range(window, len(c) - window):
-            val = float(c.iloc[i])
+        for i in range(window, len(vals) - window):
+            seg = vals[i - window : i + window + 1]
+            v = float(vals[i])
             if mode == "support":
-                if val == c.iloc[i-window:i+window].min() and val < cp:
-                    levels.append(round(val, 2))
-            else:
-                if val == c.iloc[i-window:i+window].max() and val > cp:
-                    levels.append(round(val, 2))
-        # Ambil n level TERDEKAT ke harga sekarang (bukan swing paling ekstrem):
-        #  • support   → nilai TERBESAR di bawah harga  → urut MENURUN, ambil n.
-        #  • resistance → nilai TERKECIL di atas harga    → urut MENAIK, ambil n.
-        # (Sebelumnya arah sort terbalik sehingga selalu memilih swing high/low
-        #  2 tahun terjauh — mis. resistance 5200 / support 2565 saat harga 4215.)
-        levels = sorted(set(levels), reverse=(mode == "support"))
-        return levels[:n]
+                if v == seg.min() and v < cp:
+                    levels.append(v)
+            elif v == seg.max() and v > cp:
+                levels.append(v)
+
+        # Terdekat ke harga lebih dulu: support = terbesar di bawah harga,
+        # resistance = terkecil di atas harga.
+        levels.sort(reverse=(mode == "support"))
+
+        out: list = []
+        for v in levels:
+            if all(abs(v - u) / cp * 100 >= min_gap_pct for u in out):
+                out.append(round(v, 2))
+                if len(out) == n:
+                    break
+        return out
 
     def get_dataframe(self) -> pd.DataFrame:
         """Kembalikan DataFrame dengan semua kolom indikator."""

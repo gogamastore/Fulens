@@ -14,10 +14,23 @@ import fulens_client
 from config import BotSettings
 from mt5_connector import MT5Connector
 from risk_manager import RiskManager
-from strategy.indicators import enrich
+from strategy import scalp
+from strategy.indicators import efficiency_ratio, enrich
 from trade_executor import TradeExecutor
 
 log = logging.getLogger("engine")
+
+
+def _last(df, col: str, default: float = 0.0) -> float:
+    """Nilai terakhir sebuah kolom, aman terhadap kolom hilang & NaN.
+    (EMA200/vol_ma butuh banyak bar — awal data pasti NaN.)"""
+    if col not in df.columns:
+        return default
+    try:
+        v = float(df[col].iloc[-1])
+    except (TypeError, ValueError):
+        return default
+    return default if v != v else v  # v != v → NaN
 
 
 class BotEngine:
@@ -100,6 +113,15 @@ class BotEngine:
                                          upd["sl"], upd["tp"]):
                 self._publish("trailing", upd)
 
+    def _scalp_active(self) -> bool:
+        """Mode scalping sengaja disempitkan: hanya M15 dan hanya saat bot fokus
+        pada SATU simbol (execution_mode="selected"). Gerbangnya menilai lokasi
+        harga terhadap struktur — itu cuma bermakna untuk horizon scalping, dan
+        menyebar perhatian ke 8 simbol sekaligus bukan scalping."""
+        return (self.s.scalp_enabled
+                and self.s.signal_timeframe == "M15"
+                and self.s.execution_mode == "selected")
+
     # ---------- keputusan per simbol (100% dari FuLens) ----------
     def _handle_symbol(self, symbol: str, all_pos: list, atr_map: dict):
         decision = fulens_client.fetch_signal(symbol, self.s.signal_timeframe)
@@ -113,7 +135,7 @@ class BotEngine:
         need_bars = max(self.s.atr_period, 20) + 5
         if df is None or len(df) < need_bars:
             return
-        df = enrich(df, self.s.atr_period)
+        df = enrich(df, self.s.atr_period, self.s.scalp_vol_period)
         atr = float(df["atr"].iloc[-1])          # ATR timeframe sinyal → dipakai untuk
         stoch_k = float(df["stoch_k"].iloc[-1])  # timing stochastic & jarak scaling entry.
 
@@ -202,6 +224,29 @@ class BotEngine:
             else:
                 rec["scaling"] = (f"{self.s.scaling_mode} e{m + 1}: gerak "
                                   f"{moved:.2f} ≥ {need:.2f} ({m * self.s.add_step_atr}×ATR)")
+
+        # 5) Gerbang SCALPING — hanya M15 + fokus satu simbol. Menilai LOKASI entry
+        #    (ruang ke level lawan, rezim pasar, volume); arah tetap dari FuLens.
+        #    Berlaku juga untuk entry tambahan: menambah posisi tepat di resisten
+        #    sama rawannya dengan membukanya di sana.
+        if allow_add and self._scalp_active():
+            v = scalp.evaluate(
+                direction=target,
+                price=float(df["close"].iloc[-1]),  # bar berjalan = harga kini
+                atr=atr,
+                er=efficiency_ratio(df["close"]),
+                ema50=_last(df, "ema50"),
+                ema200=_last(df, "ema200"),
+                volume=_last(df, "tick_volume"),
+                vol_ma=_last(df, "vol_ma"),
+                support=decision.support,
+                resistance=decision.resistance,
+                s=self.s,
+            )
+            rec["scalp_regime"] = v.regime
+            rec["scalp"] = v.reason
+            if not v.ok:
+                allow_add = False
 
         rec["planned_entries"] = 1 if allow_add else 0
         if actionable and not timing_ok:

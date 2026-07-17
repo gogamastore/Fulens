@@ -302,6 +302,17 @@ async def startup():
     print("\n🏅 FuLens API Server starting...")
     load_models()
     load_data_cache()
+
+    # Hangatkan cache OHLC di latar belakang. Tanpa ini, request PERTAMA untuk
+    # tiap (simbol, timeframe) harus menunggu unduhan yfinance yang bisa puluhan
+    # detik → proxy eksekutor timeout → 502. Prewarm menanggung biaya itu di awal,
+    # saat belum ada yang menunggu. Simbol yang dieksekusi bot didahulukan.
+    hot = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "XAGUSD",
+           "AUDUSD", "BTCUSD", "ETHUSD"]
+    pairs = [(s, tf) for s in hot for tf in timeframes.all_timeframes()]
+    market_data.prewarm(pairs)
+    print(f"● Prewarm cache berjalan di latar belakang ({len(pairs)} pasangan)...")
+
     print("✓ Server siap di http://localhost:8000")
     print("✓ Dokumentasi  : http://localhost:8000/docs\n")
 

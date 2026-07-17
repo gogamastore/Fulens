@@ -4,8 +4,18 @@ Peran: penghubung MURNI ke MT5. Tidak ada lagi "otak"/strategi di sini —
 seluruh keputusan arah (BUY/SELL/NETRAL) datang dari backend FuLens (ML).
 Eksekutor hanya: ambil sinyal FuLens → hitung lot/SL/TP (ATR) → kirim ke MT5,
 lalu kelola trailing stop & proteksi drawdown.
+
+Nilai di `BotSettings` adalah DEFAULT PABRIK. Setelan yang diubah lewat aplikasi
+(PUT /settings) disimpan ke `bot_settings.json` di folder ini dan dimuat kembali
+saat start — lihat load_settings()/save_settings() di bawah.
 """
-from pydantic import BaseModel
+import json
+import logging
+from pathlib import Path
+
+from pydantic import BaseModel, ValidationError
+
+log = logging.getLogger("config")
 
 
 class BotSettings(BaseModel):
@@ -56,13 +66,34 @@ class BotSettings(BaseModel):
     tp_step_atr: float = 0.5
     min_tp_atr_mult: float = 0.5
 
+    # ── Mode SCALPING (adaptif-rezim) ────────────────────────────────
+    # Aktif HANYA bila signal_timeframe == "M15" DAN execution_mode == "selected"
+    # (fokus satu simbol). Perannya FILTER: otak FuLens tetap penentu arah, gerbang
+    # ini cuma memblokir entry yang lokasi/kondisinya buruk. Lihat strategy/scalp.py.
+    scalp_enabled: bool = True
+    # Ruang minimum ke level lawan sebelum entry = mult × tp_atr_mult × ATR.
+    # Inti anti-danger-zone: BUY butuh ruang ke resisten, SELL butuh ruang ke support.
+    # Naikkan = lebih selektif (entry lebih jarang, tapi TP lebih realistis).
+    scalp_min_room_mult: float = 0.6
+    # Efficiency Ratio: ≥ nilai ini dianggap TRENDING (ikut tren), di bawahnya
+    # RANGING (mean-reversion di S/R). 0.3 = titik tengah yang umum dipakai.
+    scalp_er_trend: float = 0.30
+    # Saat TRENDING: entry ditolak bila harga sudah > nilai ini × ATR dari EMA50
+    # (dianggap mengejar; tunggu pullback).
+    scalp_ext_atr: float = 1.5
+    # Saat RANGING: "menempel level" = dalam jarak ini × ATR dari support/resisten.
+    scalp_near_atr: float = 1.0
+    # Volume minimum = mult × rata-rata tick_volume (partisipasi pasar).
+    scalp_vol_mult: float = 0.8
+    scalp_vol_period: int = 20
+
     # ── Timing entry via Stochastic (HANYA timeframe M15) ────────────
     # Di M15: walau sinyal valid, bot MENUNGGU momen —
     #   SELL → %K ≥ stoch_upper (overbought); BUY → %K ≤ stoch_lower (oversold).
     # Timeframe lain: entry mengikuti sinyal saja (tanpa gerbang stochastic).
     entry_timing_enabled: bool = True
-    stoch_upper: float = 80.0
-    stoch_lower: float = 20.0
+    stoch_upper: float = 70.0
+    stoch_lower: float = 30.0
 
     # ── Risk management (mekanika eksekusi, bukan keputusan) ─────────
     risk_percent: float = 0.5     # % equity yang dirisikokan per entry
@@ -126,4 +157,44 @@ class ServerConfig:
     MT5_PATH: str | None = None  # path terminal64.exe jika perlu
 
 
-settings = BotSettings()
+# ── Penyimpanan setelan (agar pilihan bertahan setelah restart) ──────
+# Tanpa ini, PUT /settings hanya mengubah objek di memori: ganti timeframe ke M15
+# lewat aplikasi → restart eksekutor → balik lagi ke default D1 di atas.
+SETTINGS_FILE = Path(__file__).parent / "bot_settings.json"
+
+
+def load_settings() -> BotSettings:
+    """Setelan tersimpan (bila ada) ditumpuk di atas default pabrik.
+
+    Field yang tak ada di file memakai default — jadi menambah setelan baru ke
+    BotSettings tidak merusak file lama, dan setelan usang yang sudah dihapus dari
+    kelas ini diabaikan begitu saja. Bila file rusak/tak terbaca → pakai default.
+    """
+    if not SETTINGS_FILE.exists():
+        return BotSettings()
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        s = BotSettings(**data)
+        log.info("Setelan dimuat dari %s (timeframe=%s)",
+                 SETTINGS_FILE.name, s.signal_timeframe)
+        return s
+    except (json.JSONDecodeError, ValidationError, OSError, TypeError) as e:
+        log.warning("Gagal baca %s (%s) — pakai default pabrik",
+                    SETTINGS_FILE.name, e)
+        return BotSettings()
+
+
+def save_settings(s: BotSettings) -> bool:
+    """Tulis setelan ke disk. Ditulis ke file sementara lalu di-rename agar file
+    tidak tertinggal separuh jika proses mati di tengah penulisan."""
+    try:
+        tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(s.model_dump(), indent=2), encoding="utf-8")
+        tmp.replace(SETTINGS_FILE)
+        return True
+    except OSError as e:
+        log.warning("Gagal simpan %s: %s", SETTINGS_FILE.name, e)
+        return False
+
+
+settings = load_settings()

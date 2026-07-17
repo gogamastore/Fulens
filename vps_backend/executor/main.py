@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 
 import fulens_client
 from bot_engine import BotEngine
-from config import BotSettings, ServerConfig, settings
+from config import BotSettings, ServerConfig, save_settings, settings
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -123,6 +123,7 @@ def get_settings():
 def update_settings(new: BotSettings):
     engine.s = new
     engine.risk.s = new
+    save_settings(new)  # bertahan setelah restart (mis. timeframe pilihan pengguna)
     return engine.s.model_dump()
 
 

@@ -6,3 +6,8 @@
 # Log runtime
 brain/logs/
 executor/logs/
+
+# Setelan bot yang diubah lewat aplikasi (state runtime per-VPS, bukan kode).
+# Default pabriknya ada di executor/config.py.
+executor/bot_settings.json
+executor/bot_settings.json.tmp

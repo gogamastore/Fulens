@@ -30,6 +30,9 @@ _TTL = 300  # detik
 _LOCKS: dict[tuple, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 
+# Key yang sedang di-refresh di latar belakang (agar tak menumpuk thread).
+_REFRESHING: set[tuple] = set()
+
 
 def _lock_for(key: tuple) -> threading.Lock:
     with _LOCKS_GUARD:
@@ -69,6 +72,57 @@ def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.dropna(subset=["gold_close"])
 
 
+def _download(ticker: str, spec: dict, start, end) -> pd.DataFrame | None:
+    """Unduh mentah dari yfinance lalu alias/resample ke skema `gold_*`."""
+    kw = dict(interval=spec["interval"], auto_adjust=True, progress=False)
+    if start or end:
+        raw = yf.download(ticker, start=start, end=end, **kw)
+    else:
+        raw = yf.download(ticker, period=spec["period"], **kw)
+    if raw is None or len(raw) == 0:
+        return None
+    df = _alias(raw)
+    if spec["resample"]:
+        df = _resample(df, spec["resample"])
+    return df
+
+
+def _fetch_into_cache(key, ticker, spec, start, end) -> pd.DataFrame | None:
+    """Unduh (dengan kunci per-key) lalu simpan ke cache. Mengembalikan data lama
+    bila unduhan gagal — lebih baik basi daripada tak ada."""
+    with _lock_for(key):
+        hit = _CACHE.get(key)
+        if hit and time.time() - hit[0] < _TTL:
+            return hit[1]                       # thread lain sudah mengisi
+        try:
+            df = _download(ticker, spec, start, end)
+        except Exception as e:
+            log.warning("Gagal unduh %s: %s", ticker, e)
+            return hit[1] if hit else None
+        if df is None or len(df) == 0:
+            log.warning("Data kosong untuk %s", ticker)
+            return hit[1] if hit else None
+        _CACHE[key] = (time.time(), df)
+        return df
+
+
+def _refresh_bg(key, ticker, spec, start, end):
+    """Perbarui cache di latar belakang; maksimal satu refresh per key."""
+    with _LOCKS_GUARD:
+        if key in _REFRESHING:
+            return
+        _REFRESHING.add(key)
+
+    def run():
+        try:
+            _fetch_into_cache(key, ticker, spec, start, end)
+        finally:
+            with _LOCKS_GUARD:
+                _REFRESHING.discard(key)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def get_ohlc(symbol: str, timeframe: str = "D1",
              start: str | None = None, end: str | None = None) -> pd.DataFrame | None:
     """DataFrame OHLC (kolom `gold_*`) untuk simbol pada timeframe tertentu.
@@ -76,6 +130,13 @@ def get_ohlc(symbol: str, timeframe: str = "D1",
     - timeframe: M15/M30/H1/H4/D1/W1
     - start/end: 'YYYY-MM-DD' (opsional; untuk backtest rentang tanggal).
       Bila diisi, menggantikan `period` bawaan timeframe.
+
+    Pola *stale-while-revalidate*: request TIDAK PERNAH menunggu unduhan selama
+    cache pernah terisi. Unduhan intraday yfinance bisa makan puluhan detik —
+    kalau request ikut menunggu, proxy eksekutor keburu timeout → 502. Jadi:
+      • cache segar  → langsung sajikan;
+      • cache basi   → sajikan yang LAMA sekarang, perbarui di latar belakang;
+      • belum ada    → terpaksa menunggu (sekali saja; ditutup oleh prewarm()).
     """
     ticker = sym.yf_ticker(symbol)
     if not ticker:
@@ -84,39 +145,35 @@ def get_ohlc(symbol: str, timeframe: str = "D1",
 
     spec = tfmod.spec(timeframe)
     key = (ticker, tfmod.normalize(timeframe), start, end)
-    now = time.time()
     hit = _CACHE.get(key)
-    if hit and now - hit[0] < _TTL:
-        return hit[1]
 
-    # Hanya satu thread yang mengunduh (simbol, tf) ini pada satu waktu.
-    with _lock_for(key):
-        # Cek ulang: thread lain mungkin sudah mengisi cache saat kita menunggu.
-        now = time.time()
-        hit = _CACHE.get(key)
-        if hit and now - hit[0] < _TTL:
+    if hit:
+        if time.time() - hit[0] < _TTL:
             return hit[1]
+        _refresh_bg(key, ticker, spec, start, end)
+        return hit[1]                           # sajikan basi, jangan blokir
 
-        try:
-            kw = dict(interval=spec["interval"], auto_adjust=True, progress=False)
-            if start or end:
-                raw = yf.download(ticker, start=start, end=end, **kw)
-            else:
-                raw = yf.download(ticker, period=spec["period"], **kw)
-        except Exception as e:
-            log.warning("Gagal unduh %s (%s): %s", symbol, ticker, e)
-            return hit[1] if hit else None
+    return _fetch_into_cache(key, ticker, spec, start, end)
 
-        if raw is None or len(raw) == 0:
-            log.warning("Data kosong untuk %s (%s)", symbol, ticker)
-            return hit[1] if hit else None
 
-        df = _alias(raw)
-        if spec["resample"]:
-            df = _resample(df, spec["resample"])
+def prewarm(pairs: list[tuple[str, str]], delay: float = 1.5):
+    """Isi cache di latar belakang saat startup, agar request pertama tak menunggu.
 
-        _CACHE[key] = (now, df)
-        return df
+    Dijalankan berurutan dengan jeda: Yahoo Finance membatasi laju, dan menembak
+    puluhan unduhan sekaligus justru membuat semuanya lambat/gagal.
+    """
+    def run():
+        ok = 0
+        for s, tf in pairs:
+            try:
+                if get_ohlc(s, tf) is not None:
+                    ok += 1
+            except Exception as e:
+                log.warning("Prewarm %s %s gagal: %s", s, tf, e)
+            time.sleep(delay)
+        log.info("Prewarm selesai: %d/%d pasangan siap di cache", ok, len(pairs))
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def latest_price(symbol: str, timeframe: str = "D1") -> dict | None:
