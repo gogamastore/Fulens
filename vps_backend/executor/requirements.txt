@@ -1,8 +1,7 @@
-MetaTrader5==5.0.5735
+# Gerbang EA-driven. TIDAK lagi butuh MetaTrader5 (EA yang jadi tangan), maupun
+# pandas/numpy (perhitungan pindah ke otak). Jadi gerbang bisa jalan di OS apa pun.
 fastapi>=0.110
 uvicorn[standard]>=0.29
 wsproto>=1.2
-pandas>=2.0
-numpy>=1.26
 httpx>=0.27
 pydantic>=2.6

@@ -1,24 +1,38 @@
 """
-FuLens — Modul Indikator Teknikal
-Menghitung 25+ indikator teknikal dan menghasilkan sinyal beli/jual/netral.
+FuLens — Modul Indikator Teknikal (4 komponen)
+
+Hitungan MURNI saja: Bollinger Bands, Stochastic, MACD, ATR, pivot & S&R.
+Tidak ada keputusan di sini — keputusan ada di `strategy.py`. Pemisahan ini
+disengaja: gerbang strategi bisa di-backtest tanpa menyeret lapisan tampilan.
+
+Sengaja DIBUANG (dulu ikut voting): EMA20/50/200, SMA50/200, RSI, CCI,
+Williams %R, ROC, Momentum, ADX, Parabolic SAR, Ichimoku, OBV. Alasannya bukan
+sekadar "terlalu banyak" — lima di antaranya (EMA20/50/200, SMA50/200) mengukur
+hal yang identik: "harga di atas/di bawah garis rata-rata". Ditambah PSAR &
+Ichimoku yang juga mengukur posisi tren, votingnya bukan 16 pendapat independen
+melainkan satu pendapat tren yang berteriak tujuh kali — sehingga setiap setup
+reversal otomatis kalah suara. Lihat strategy.py untuk penjelasan lengkapnya.
+
+ATR TETAP ADA tapi bukan komponen sinyal: risk_manager memakainya untuk ukuran
+lot dan jarak SL/TP.
 
 Jalankan standalone: python indicators.py
-Atau import ke modul lain: from indicators import TechnicalAnalyzer
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
-import pandas as pd
-import numpy as np
-from tabulate import tabulate
-from colorama import init, Fore, Style
 from dataclasses import dataclass, field
-from typing import Optional
+
+import numpy as np
+import pandas as pd
+from colorama import Fore, Style, init
+from tabulate import tabulate
 
 init(autoreset=True)
 import config
-from ta import trend, momentum, volatility, volume as ta_volume
+import strategy
+
 
 # ─────────────────────────────────────────────────────────
 #  DATA CLASS HASIL INDIKATOR
@@ -28,28 +42,75 @@ class SignalResult:
     name    : str
     value   : float
     signal  : str        # "BELI" | "JUAL" | "NETRAL"
-    category: str        # "Tren" | "Momentum" | "Volatilitas" | "Volume"
+    category: str        # "Tren" | "Momentum" | "Volatilitas"
     detail  : str = ""
+
 
 @dataclass
 class AnalysisReport:
     timestamp       : str = ""
     current_price   : float = 0.0
     signals         : list = field(default_factory=list)
+    # Sisa dari era voting. Dengan gerbang AND, "9 beli vs 3 jual" tidak punya
+    # arti — hasilnya biner. Dibiarkan 0 supaya terlihat jelas sudah tidak
+    # berlaku, bukan diisi angka yang tampak masuk akal tapi menyesatkan.
+    # Penggantinya: `gates`.
     buy_count       : int = 0
     sell_count      : int = 0
     neutral_count   : int = 0
     overall_signal  : str = "NETRAL"
-    confidence      : float = 0.0
+    confidence      : float = 0.0    # 0..1 (signal_engine mengalikannya × 100)
     support_levels  : list = field(default_factory=list)
     resistance_levels: list = field(default_factory=list)
+    # Baru: hasil gerbang konfluensi — inti laporan sekarang.
+    gates           : list = field(default_factory=list)
+    mode            : str = "swing"
+    direction       : str | None = None
+    # Arah yang gerbangnya sedang ditampilkan saat belum ada setup (paling dekat
+    # lolos). Tanpa ini UI menyangka diagnosa selalu untuk BUY.
+    probe_direction : str | None = None
+    atr             : float = 0.0    # ATR bar tertutup — dasar jarak SL/TP di EA
+
+
+# ─────────────────────────────────────────────────────────
+#  PIVOT (fractal) — dipakai S&R DAN deteksi divergence
+# ─────────────────────────────────────────────────────────
+def find_pivots(series: pd.Series, window: int, mode: str) -> list:
+    """Indeks bar yang jadi swing pivot (fractal) pada `series`.
+
+    Bar ke-i disebut swing low bila nilainya terendah di antara `window` bar
+    sebelum dan sesudahnya; swing high sebaliknya.
+
+    Catatan penting: sebuah pivot baru bisa dipastikan setelah `window` bar
+    berikutnya terbentuk — jadi pivot termuda selalu minimal `window` bar di
+    belakang. Itu sifat bawaan fractal, bukan bug; konsekuensinya deteksi
+    divergence memang selalu telat sedikit.
+
+    Jendela kecil itu disengaja. Versi lama memakai `close` dengan jendela ±20
+    bar: pada tren naik kuat, low pullback TIDAK pernah jadi minimum jendela 40
+    bar, jadi yang lolos hanya titik AWAL tren → support ratusan dolar jauhnya
+    (mis. 3293 saat harga 4215). Jendela ±5 pada high/low menangkap swing yang
+    sebenarnya.
+    """
+    vals = series.values
+    out = []
+    for i in range(window, len(vals) - window):
+        seg = vals[i - window : i + window + 1]
+        v = vals[i]
+        if not np.isfinite(v):
+            continue
+        if mode == "low" and v == seg.min():
+            out.append(i)
+        elif mode == "high" and v == seg.max():
+            out.append(i)
+    return out
 
 
 # ─────────────────────────────────────────────────────────
 #  KELAS UTAMA
 # ─────────────────────────────────────────────────────────
 class TechnicalAnalyzer:
-    """Hitung semua indikator teknikal dari DataFrame OHLCV."""
+    """Hitung 4 komponen strategi + ATR dari DataFrame OHLCV."""
 
     def __init__(self, df: pd.DataFrame):
         self.df     = df.copy()
@@ -76,282 +137,199 @@ class TechnicalAnalyzer:
         if sell_cond: return "JUAL"
         return "NETRAL"
 
-    # ── KALKULASI SEMUA INDIKATOR ─────────────────────────
+    # ── KALKULASI ─────────────────────────────────────────
     def _calculate_all(self) -> dict:
-        c = self.close; h = self.high; l = self.low; v = self.volume
+        c = self.close; h = self.high; l = self.low
         p = self.p
-
-        # ── Trend ──────────────────────────────────────────
-        ema20  = self._ema(c, p["EMA_SHORT"])
-        ema50  = self._ema(c, p["EMA_MED"])
-        ema200 = self._ema(c, p["EMA_LONG"])
-        sma50  = self._sma(c, p["SMA_SHORT"])
-        sma200 = self._sma(c, p["SMA_LONG"])
+        sp = config.STRATEGY_PARAMS
 
         # ── MACD ───────────────────────────────────────────
-        ema_fast   = self._ema(c, p["MACD_FAST"])
-        ema_slow   = self._ema(c, p["MACD_SLOW"])
-        macd_line  = ema_fast - ema_slow
-        macd_signal= self._ema(macd_line, p["MACD_SIGNAL"])
-        macd_hist  = macd_line - macd_signal
-
-        # ── RSI ────────────────────────────────────────────
-        delta  = c.diff()
-        gain   = delta.clip(lower=0).ewm(com=p["RSI_PERIOD"]-1, adjust=False).mean()
-        loss   = (-delta.clip(upper=0)).ewm(com=p["RSI_PERIOD"]-1, adjust=False).mean()
-        rs     = gain / loss.replace(0, np.nan)
-        rsi    = 100 - (100 / (1 + rs))
+        macd_line   = self._ema(c, p["MACD_FAST"]) - self._ema(c, p["MACD_SLOW"])
+        macd_signal = self._ema(macd_line, p["MACD_SIGNAL"])
+        macd_hist   = macd_line - macd_signal
 
         # ── Bollinger Bands ────────────────────────────────
         bb_mid   = self._sma(c, p["BB_PERIOD"])
         bb_std   = c.rolling(p["BB_PERIOD"]).std()
         bb_upper = bb_mid + p["BB_STD"] * bb_std
         bb_lower = bb_mid - p["BB_STD"] * bb_std
+        # bb_width dinormalisasi ke % dari mid → sebanding lintas simbol dan
+        # lintas level harga. Ini yang dipakai gerbang squeeze (via persentil).
         bb_width = (bb_upper - bb_lower) / bb_mid * 100
         bb_pct_b = (c - bb_lower) / (bb_upper - bb_lower)
+        # Acuan squeeze: persentil lebar BB terhadap DIRINYA SENDIRI selama N bar.
+        # Dihitung sekali di sini, bukan di dalam gerbang — gerbang dipanggil dua
+        # kali per bar (BUY & SELL) dan rolling quantile itu mahal.
+        # min_periods: separuh jendela sudah cukup untuk acuan yang bermakna,
+        # supaya simbol/timeframe dengan data pendek tidak mati total.
+        sq_win = sp["BB_SQUEEZE_WINDOW"]
+        bb_width_ref = bb_width.rolling(sq_win, min_periods=sq_win // 2).quantile(
+            sp["BB_SQUEEZE_PCTILE"] / 100.0)
 
         # ── Stochastic ────────────────────────────────────
-        k_period = p["STOCH_K"]
-        low_min  = l.rolling(k_period).min()
-        high_max = h.rolling(k_period).max()
+        low_min  = l.rolling(p["STOCH_K"]).min()
+        high_max = h.rolling(p["STOCH_K"]).max()
         stoch_k  = 100 * (c - low_min) / (high_max - low_min).replace(0, np.nan)
         stoch_d  = self._sma(stoch_k, p["STOCH_D"])
 
-        # ── ATR ───────────────────────────────────────────
-        tr1  = h - l
-        tr2  = (h - c.shift()).abs()
-        tr3  = (l - c.shift()).abs()
-        tr   = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr  = self._ema(tr, p["ATR_PERIOD"])
+        # ── ATR (mekanika risiko, bukan sinyal) ───────────
+        tr1 = h - l
+        tr2 = (h - c.shift()).abs()
+        tr3 = (l - c.shift()).abs()
+        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = self._ema(tr, p["ATR_PERIOD"])
 
-        # ── CCI ───────────────────────────────────────────
-        tp   = (h + l + c) / 3
-        cci  = (tp - self._sma(tp, p["CCI_PERIOD"])) / (0.015 * tp.rolling(p["CCI_PERIOD"]).std())
-
-        # ── Williams %R ───────────────────────────────────
-        wp   = p["WILLIAMS_PERIOD"]
-        wr   = -100 * (h.rolling(wp).max() - c) / (h.rolling(wp).max() - l.rolling(wp).min()).replace(0, np.nan)
-
-        # ── ROC ───────────────────────────────────────────
-        roc  = c.pct_change(12) * 100
-
-        # ── ADX ───────────────────────────────────────────
-        dm_plus  = (h.diff()).clip(lower=0)
-        dm_minus = (-l.diff()).clip(lower=0)
-        dm_plus  = dm_plus.where(dm_plus > dm_minus, 0)
-        dm_minus = dm_minus.where(dm_minus > dm_plus, 0)
-        di_plus  = 100 * self._ema(dm_plus, p["ADX_PERIOD"]) / atr.replace(0, np.nan)
-        di_minus = 100 * self._ema(dm_minus, p["ADX_PERIOD"]) / atr.replace(0, np.nan)
-        dx       = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
-        adx      = self._sma(dx, p["ADX_PERIOD"])
-
-        # ── Parabolic SAR (sederhana) ──────────────────────
-        sar = self._calc_psar(h, l, c)
-
-        # ── OBV ───────────────────────────────────────────
-        obv = (np.sign(c.diff()) * v).fillna(0).cumsum()
-
-        # ── Momentum ──────────────────────────────────────
-        momentum = c - c.shift(10)
-
-        # ── Ichimoku ──────────────────────────────────────
-        tenkan  = (h.rolling(9).max()  + l.rolling(9).min())  / 2
-        kijun   = (h.rolling(26).max() + l.rolling(26).min()) / 2
-        senkou_a = ((tenkan + kijun) / 2).shift(26)
-        senkou_b = ((h.rolling(52).max() + l.rolling(52).min()) / 2).shift(26)
+        # ── EMA tren (gerbang arah, BUKAN pemilih) ────────
+        ema_trend = self._ema(c, p["EMA_TREND"])
 
         return {
-            "ema20": ema20, "ema50": ema50, "ema200": ema200,
-            "sma50": sma50, "sma200": sma200,
+            "close": c, "high": h, "low": l,
             "macd_line": macd_line, "macd_signal": macd_signal, "macd_hist": macd_hist,
-            "rsi": rsi,
             "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
             "bb_width": bb_width, "bb_pct_b": bb_pct_b,
+            "bb_width_ref": bb_width_ref,
             "stoch_k": stoch_k, "stoch_d": stoch_d,
-            "atr": atr, "cci": cci, "wr": wr, "roc": roc,
-            "adx": adx, "di_plus": di_plus, "di_minus": di_minus,
-            "sar": sar, "obv": obv, "momentum": momentum,
-            "tenkan": tenkan, "kijun": kijun,
-            "senkou_a": senkou_a, "senkou_b": senkou_b,
+            "atr": atr, "ema_trend": ema_trend,
         }
 
-    @staticmethod
-    def _calc_psar(high, low, close, af_start=0.02, af_max=0.2) -> pd.Series:
-        """Simplified Parabolic SAR."""
-        sar_vals = close.copy() * np.nan
-        try:
-            bull = True
-            sar  = low.iloc[0]
-            ep   = high.iloc[0]
-            af   = af_start
-            for i in range(1, len(close)):
-                prev_sar = sar
-                sar = prev_sar + af * (ep - prev_sar)
-                if bull:
-                    sar = min(sar, low.iloc[i-1], low.iloc[max(0,i-2)])
-                    if low.iloc[i] < sar:
-                        bull = False; sar = ep; ep = low.iloc[i]; af = af_start
-                    else:
-                        if high.iloc[i] > ep:
-                            ep = high.iloc[i]
-                            af = min(af + af_start, af_max)
-                else:
-                    sar = max(sar, high.iloc[i-1], high.iloc[max(0,i-2)])
-                    if high.iloc[i] > sar:
-                        bull = True; sar = ep; ep = high.iloc[i]; af = af_start
-                    else:
-                        if low.iloc[i] < ep:
-                            ep = low.iloc[i]
-                            af = min(af + af_start, af_max)
-                sar_vals.iloc[i] = sar
-        except Exception:
-            pass
-        return sar_vals
+    # ── LAPORAN ───────────────────────────────────────────
+    def get_signals(self, mode: str = "swing") -> AnalysisReport:
+        """Jalankan gerbang strategi, bungkus jadi AnalysisReport.
 
-    # ── GENERATE SINYAL ───────────────────────────────────
-    def get_signals(self) -> AnalysisReport:
-        """Hasilkan semua sinyal berdasarkan nilai indikator terakhir."""
-        d    = {k: v.iloc[-1] if not v.empty else np.nan for k, v in self._calc.items()}
-        cp   = float(self.close.iloc[-1])
+        Bentuk AnalysisReport dipertahankan supaya /api/v1/indicators dan model
+        Flutter yang ada tidak harus diubah serentak.
+        """
+        # S&R HARUS disaring terhadap bar yang sama dengan yang dinilai gerbang.
+        # Kalau tidak: level disaring vs bar berjalan (mis. 4215) tapi gerbang
+        # menilai bar tertutup (mis. 4090) → muncul "support" di ATAS harga yang
+        # dinilai, dan gerbang Ruang S&R jadi salah hitung.
+        idx = len(self.close) + strategy.BAR_CLOSED
+        if idx < 0:
+            idx = len(self.close) - 1
+        support    = self._find_levels(mode="support", idx=idx)
+        resistance = self._find_levels(mode="resistance", idx=idx)
+        setup = strategy.evaluate(self._calc, support, resistance, mode=mode, idx=idx)
+
         report = AnalysisReport()
-        report.current_price = cp
-        report.timestamp = str(self.close.index[-1].date())
-        sigs = []
-
-        def safe(val):
-            return float(val) if pd.notna(val) else 0.0
-
-        # ── Tren ──────────────────────────────────────────
-        sigs += [
-            SignalResult("EMA 20",   safe(d["ema20"]),   self._signal(None, cp > safe(d["ema20"]),   cp < safe(d["ema20"])),   "Tren",  f"Harga {'di atas' if cp > safe(d['ema20']) else 'di bawah'} EMA20"),
-            SignalResult("EMA 50",   safe(d["ema50"]),   self._signal(None, cp > safe(d["ema50"]),   cp < safe(d["ema50"])),   "Tren",  ""),
-            SignalResult("EMA 200",  safe(d["ema200"]),  self._signal(None, cp > safe(d["ema200"]),  cp < safe(d["ema200"])),  "Tren",  "Tren jangka panjang"),
-            SignalResult("SMA 50",   safe(d["sma50"]),   self._signal(None, cp > safe(d["sma50"]),   cp < safe(d["sma50"])),   "Tren",  ""),
-            SignalResult("SMA 200",  safe(d["sma200"]),  self._signal(None, cp > safe(d["sma200"]),  cp < safe(d["sma200"])),  "Tren",  "Golden/Death cross"),
-            SignalResult("MACD",     safe(d["macd_line"]),
-                self._signal(None, safe(d["macd_line"]) > safe(d["macd_signal"]) and safe(d["macd_hist"]) > 0,
-                                   safe(d["macd_line"]) < safe(d["macd_signal"]) and safe(d["macd_hist"]) < 0),
-                "Tren", f"Hist: {safe(d['macd_hist']):.2f}"),
-            SignalResult("Parabolic SAR", safe(d["sar"]),
-                self._signal(None, cp > safe(d["sar"]), cp < safe(d["sar"])),
-                "Tren", ""),
-            SignalResult("ADX", safe(d["adx"]),
-                self._signal(None,
-                    safe(d["adx"]) > 25 and safe(d["di_plus"]) > safe(d["di_minus"]),
-                    safe(d["adx"]) > 25 and safe(d["di_plus"]) < safe(d["di_minus"])),
-                "Tren", f"Kekuatan tren: {'Kuat' if safe(d['adx'])>25 else 'Lemah'}"),
-            SignalResult("Ichimoku", safe(d["tenkan"]),
-                self._signal(None,
-                    cp > max(safe(d["senkou_a"]), safe(d["senkou_b"])),
-                    cp < min(safe(d["senkou_a"]), safe(d["senkou_b"]))),
-                "Tren", "Posisi vs Kumo cloud"),
-        ]
-
-        # ── Momentum ──────────────────────────────────────
-        rsi_val = safe(d["rsi"])
-        sigs += [
-            SignalResult("RSI (14)", rsi_val,
-                self._signal(None, rsi_val < config.SIGNAL_THRESHOLDS["RSI_OVERSOLD"],
-                                   rsi_val > config.SIGNAL_THRESHOLDS["RSI_OVERBOUGHT"]),
-                "Momentum", f"{'Oversold' if rsi_val<30 else 'Overbought' if rsi_val>70 else 'Netral'}"),
-            SignalResult("Stochastic %K", safe(d["stoch_k"]),
-                self._signal(None, safe(d["stoch_k"]) < 20 and safe(d["stoch_k"]) > safe(d["stoch_d"]),
-                                   safe(d["stoch_k"]) > 80 and safe(d["stoch_k"]) < safe(d["stoch_d"])),
-                "Momentum", ""),
-            SignalResult("CCI (20)", safe(d["cci"]),
-                self._signal(None, safe(d["cci"]) < -100, safe(d["cci"]) > 100),
-                "Momentum", ""),
-            SignalResult("Williams %R", safe(d["wr"]),
-                self._signal(None, safe(d["wr"]) < -80, safe(d["wr"]) > -20),
-                "Momentum", ""),
-            SignalResult("ROC (12)", safe(d["roc"]),
-                self._signal(None, safe(d["roc"]) > 0, safe(d["roc"]) < 0),
-                "Momentum", ""),
-            SignalResult("Momentum", safe(d["momentum"]),
-                self._signal(None, safe(d["momentum"]) > 0, safe(d["momentum"]) < 0),
-                "Momentum", ""),
-        ]
-
-        # ── Volatilitas ───────────────────────────────────
-        bb_pct = safe(d["bb_pct_b"])
-        sigs += [
-            SignalResult("BB Atas",  safe(d["bb_upper"]), "NETRAL", "Volatilitas", "Resistance dinamis"),
-            SignalResult("BB Bawah", safe(d["bb_lower"]), "NETRAL", "Volatilitas", "Support dinamis"),
-            SignalResult("BB %B",    bb_pct,
-                self._signal(None, bb_pct < 0.2, bb_pct > 0.8),
-                "Volatilitas", f"Posisi di band: {bb_pct:.2f}"),
-            SignalResult("ATR (14)", safe(d["atr"]), "NETRAL", "Volatilitas",
-                f"Range avg: ${safe(d['atr']):.2f}"),
-        ]
-
-        # ── Volume ────────────────────────────────────────
-        sigs += [
-            SignalResult("OBV", safe(d["obv"]), "NETRAL", "Volume", "On-Balance Volume"),
-        ]
-
-        # ── Hitung ringkasan ──────────────────────────────
-        report.signals  = sigs
-        buy_sigs  = [s for s in sigs if s.signal == "BELI"]
-        sell_sigs = [s for s in sigs if s.signal == "JUAL"]
-        neu_sigs  = [s for s in sigs if s.signal == "NETRAL"]
-
-        report.buy_count     = len(buy_sigs)
-        report.sell_count    = len(sell_sigs)
-        report.neutral_count = len(neu_sigs)
-
-        total = report.buy_count + report.sell_count
-        if total == 0:
-            report.overall_signal = "NETRAL"
-            report.confidence     = 0.5
-        else:
-            buy_ratio = report.buy_count / total
-            if buy_ratio >= 0.65:
-                report.overall_signal = "BELI KUAT" if buy_ratio >= 0.80 else "BELI"
-            elif buy_ratio <= 0.35:
-                report.overall_signal = "JUAL KUAT" if buy_ratio <= 0.20 else "JUAL"
-            else:
-                report.overall_signal = "NETRAL"
-            report.confidence = max(buy_ratio, 1 - buy_ratio)
-
-        # ── Support & Resistance ──────────────────────────
-        report.support_levels    = self._find_levels(mode="support")
-        report.resistance_levels = self._find_levels(mode="resistance")
-
+        report.timestamp         = setup.timestamp
+        report.current_price     = setup.current_price
+        report.overall_signal    = setup.signal
+        report.confidence        = setup.quality / 100.0   # 0..1
+        report.support_levels    = support
+        report.resistance_levels = resistance
+        report.gates             = [g.to_dict() for g in setup.gates]
+        report.mode              = setup.mode
+        report.direction         = setup.direction
+        report.probe_direction   = setup.probe_direction
+        atr = self._calc["atr"].iloc[idx] if len(self._calc["atr"]) else float("nan")
+        report.atr               = float(atr) if pd.notna(atr) else 0.0
+        report.signals           = self._component_rows(idx)
         return report
 
-    def _find_levels(self, mode="support", n=3, window=5, min_gap_pct=0.3) -> list:
-        """Level support/resistance dari swing pivot (fractal), n TERDEKAT ke harga.
+    def _component_rows(self, idx: int | None = None) -> list:
+        """Baris nilai mentah 4 komponen — untuk dilihat, bukan untuk voting.
 
-        Bar ke-i disebut swing low bila low[i] adalah nilai terendah di antara
-        `window` bar sebelum dan sesudahnya; swing high memakai high[i] sebaliknya.
+        `idx` WAJIB bar yang sama dengan yang dinilai gerbang. Kalau tidak,
+        trading_advisor.dart mencampur nilai dari dua bar berbeda: ia menghitung
+        zona entry dari BB Bawah (bar berjalan) tapi memakai `signal.support`
+        (bar tertutup). Gejalanya kentara — BB Bawah bisa muncul DI ATAS harga
+        bar tertutup, jadi "support dinamis" di atas harga.
 
-        Dua hal yang dulu salah dan menghasilkan level ngawur:
-         1. Sumbernya `close` dengan jendela ±20 bar. Pada tren naik kuat, low
-            pullback TIDAK pernah jadi minimum jendela 40 bar (harga 20 bar
-            sebelumnya lebih rendah), jadi yang lolos hanya titik AWAL tren →
-            support ratusan dolar jauhnya (mis. 3293 saat harga 4215). Resistance
-            tak kena efek ini, makanya dulu hanya support yang terlihat ngawur.
-            Jendela kecil (±5) pada high/low menangkap swing yang sebenarnya.
-         2. Arah sort terbalik → selalu mengambil swing paling ekstrem, bukan
-            terdekat (resistance 5200 / support 2565 saat harga 4215).
+        Kategori memakai nama lama ("Tren"/"Momentum"/"Volatilitas") demi model
+        IndicatorSignal di Flutter yang masih membacanya.
+        """
+        idx = -1 if idx is None else idx
+        d = {k: (v.iloc[idx] if len(v) else np.nan) for k, v in self._calc.items()}
 
-        `min_gap_pct` menyaring level yang berdempetan agar n level yang keluar
+        def safe(x):
+            return float(x) if pd.notna(x) else 0.0
+
+        macd_l, macd_s = safe(d["macd_line"]), safe(d["macd_signal"])
+        hist  = safe(d["macd_hist"])
+        k, dd = safe(d["stoch_k"]), safe(d["stoch_d"])
+        pct_b = safe(d["bb_pct_b"])
+        # Status squeeze dibaca dari acuan yang SAMA dengan gate_bb_squeeze —
+        # jangan hitung ulang di sini, itu cara klasik UI dan gerbang jadi beda.
+        _sq_ref = float(d["bb_width_ref"]) if pd.notna(d["bb_width_ref"]) else np.nan
+        _sq_pct = strategy._p("BB_SQUEEZE_PCTILE")
+        _squeeze_on = np.isfinite(_sq_ref) and safe(d["bb_width"]) < _sq_ref
+        so    = strategy._p("STOCH_OVERSOLD")
+        sob   = strategy._p("STOCH_OVERBOUGHT")
+
+        return [
+            SignalResult("MACD", macd_l,
+                self._signal(None, macd_l > macd_s and hist > 0,
+                                   macd_l < macd_s and hist < 0),
+                "Tren", f"Signal {macd_s:.2f} · Hist {hist:+.2f}"),
+            SignalResult("Stochastic %K", k,
+                self._signal(None, k < so and k > dd, k > sob and k < dd),
+                "Momentum",
+                f"%D {dd:.1f} · "
+                f"{'oversold' if k < so else 'overbought' if k > sob else 'netral'}"),
+            SignalResult("EMA 200", safe(d["ema_trend"]),
+                self._signal(None,
+                             safe(d["close"]) > safe(d["ema_trend"]),
+                             safe(d["close"]) < safe(d["ema_trend"])),
+                "Tren", "Sisi tren besar - gerbang arah di mode swing"),
+            SignalResult("BB %B", pct_b,
+                self._signal(None, pct_b < 0.2, pct_b > 0.8),
+                "Volatilitas", f"Posisi di dalam pita: {pct_b:.2f}"),
+            # Baris ini kini punya makna keputusan: ia GERBANG mode scalping.
+            # Ditampilkan bersama acuannya supaya angka lebarnya bisa dinilai —
+            # "1.8%" sendirian tak berarti apa-apa tanpa tahu ambangnya.
+            SignalResult("BB Lebar", safe(d["bb_width"]),
+                "BELI" if _squeeze_on else "NETRAL", "Volatilitas",
+                (f"Lebar {safe(d['bb_width']):.2f}% vs acuan p{_sq_pct} "
+                 f"{_sq_ref:.2f}% — "
+                 + ("MENYEMPIT, gerbang scalping terbuka" if _squeeze_on
+                    else "melebar, gerbang scalping tertutup"))
+                if np.isfinite(_sq_ref) else
+                "Lebar pita (% dari mid) — acuan squeeze belum cukup data"),
+            # "BB Atas"/"BB Bawah"/"ATR (14)" — NAMA INI KONTRAK, jangan diubah.
+            # trading_advisor.dart mencarinya lewat _getIndicatorValue(nama) dan
+            # DIAM-DIAM jatuh ke nilai karangan bila tak ketemu (mis. BB Atas →
+            # harga × 1.02), lalu memakainya untuk zona entry & target. Ketiganya
+            # tetap dihitung otak, jadi nama lama dipertahankan agar advisor dapat
+            # angka ASLI, bukan tebakan.
+            SignalResult("BB Atas", safe(d["bb_upper"]), "NETRAL", "Volatilitas",
+                "Batas atas pita — resistance dinamis"),
+            SignalResult("BB Bawah", safe(d["bb_lower"]), "NETRAL", "Volatilitas",
+                "Batas bawah pita — support dinamis"),
+            SignalResult("ATR (14)", safe(d["atr"]), "NETRAL", "Volatilitas",
+                f"Range rata-rata: {safe(d['atr']):.2f} (dipakai lot & SL/TP)"),
+        ]
+
+    def _find_levels(self, mode="support", n=3, window=None, min_gap_pct=None,
+                     idx=None) -> list:
+        """Level S&R dari swing pivot, n TERDEKAT ke harga pada bar `idx`.
+
+        `idx` default = bar terakhir. Saat dipanggil dari get_signals, ia diisi
+        bar TERTUTUP supaya sejalan dengan gerbang — support harus benar-benar di
+        bawah harga yang dinilai, bukan di bawah harga bar berjalan.
+
+        `min_gap_pct` menyaring level berdempetan agar n level yang keluar
         benar-benar berbeda, bukan tiga pivot dari satu swing yang sama.
         """
-        cp = float(self.close.iloc[-1])
-        vals = (self.low if mode == "support" else self.high).values
+        window = window if window is not None else strategy._p("SR_PIVOT_WINDOW")
+        min_gap_pct = (min_gap_pct if min_gap_pct is not None
+                       else strategy._p("SR_MIN_GAP_PCT"))
+        idx = len(self.close) - 1 if idx is None else idx
+
+        cp  = float(self.close.iloc[idx])
+        src = self.low if mode == "support" else self.high
+        piv = find_pivots(src, window, "low" if mode == "support" else "high")
+
         levels = []
-        for i in range(window, len(vals) - window):
-            seg = vals[i - window : i + window + 1]
-            v = float(vals[i])
-            if mode == "support":
-                if v == seg.min() and v < cp:
-                    levels.append(v)
-            elif v == seg.max() and v > cp:
+        for i in piv:
+            if i > idx:
+                continue          # jangan mengintip bar setelah bar yang dinilai
+            v = float(src.iloc[i])
+            if (mode == "support" and v < cp) or (mode == "resistance" and v > cp):
                 levels.append(v)
 
         # Terdekat ke harga lebih dulu: support = terbesar di bawah harga,
-        # resistance = terkecil di atas harga.
+        # resistance = terkecil di atas harga. (Arah sort ini pernah terbalik →
+        # selalu mengambil swing paling ekstrem, bukan yang terdekat.)
         levels.sort(reverse=(mode == "support"))
 
         out: list = []
@@ -363,9 +341,11 @@ class TechnicalAnalyzer:
         return out
 
     def get_dataframe(self) -> pd.DataFrame:
-        """Kembalikan DataFrame dengan semua kolom indikator."""
+        """DataFrame + semua kolom indikator (prefix ind_)."""
         df = self.df.copy()
         for name, series in self._calc.items():
+            if name in ("close", "high", "low"):
+                continue
             df[f"ind_{name}"] = series
         return df
 
@@ -373,202 +353,154 @@ class TechnicalAnalyzer:
 # ─────────────────────────────────────────────────────────
 #  TAMPILKAN LAPORAN DI TERMINAL
 # ─────────────────────────────────────────────────────────
+SIG_COLOR = {
+    "BELI": Fore.GREEN, "BELI KUAT": Fore.GREEN,
+    "JUAL": Fore.RED,   "JUAL KUAT": Fore.RED,
+    "NETRAL": Fore.YELLOW, "ERROR": Fore.WHITE,
+}
+
+
 def print_report(report: AnalysisReport):
-    SIG_COLOR = {
-        "BELI": Fore.GREEN, "BELI KUAT": Fore.GREEN,
-        "JUAL": Fore.RED,   "JUAL KUAT": Fore.RED,
-        "NETRAL": Fore.YELLOW,
-    }
-    cat_order = ["Tren", "Momentum", "Volatilitas", "Volume"]
-
-    print("\n" + "═"*68)
-    print(f"  {'LAPORAN ANALISIS TEKNIKAL — FULENS':^64}")
-    print("═"*68)
-    print(f"  Tanggal   : {report.timestamp}")
+    print("\n" + "═" * 68)
+    print(f"  {'LAPORAN SETUP — FULENS':^64}")
+    print("═" * 68)
+    print(f"  Tanggal   : {report.timestamp}  (bar tertutup)")
     print(f"  Harga     : ${report.current_price:,.2f}")
+    print(f"  Mode      : {report.mode.upper()}")
 
-    sig_clr = SIG_COLOR.get(report.overall_signal, Fore.YELLOW)
-    print(f"  Sinyal    : {sig_clr}{report.overall_signal}{Style.RESET_ALL}")
-    print(f"  Konfiden  : {report.confidence*100:.1f}%")
-    print(f"  Beli/Jual/Netral: {report.buy_count} / {report.sell_count} / {report.neutral_count}")
+    clr = SIG_COLOR.get(report.overall_signal, Fore.YELLOW)
+    print(f"  Sinyal    : {clr}{report.overall_signal}{Style.RESET_ALL}")
+    print(f"  Kualitas  : {report.confidence * 100:.1f}%")
 
-    for cat in cat_order:
-        cat_sigs = [s for s in report.signals if s.category == cat]
-        if not cat_sigs:
-            continue
-        print(f"\n  ── {cat} {'─'*(52-len(cat))}")
-        rows = []
-        for s in cat_sigs:
-            clr = SIG_COLOR.get(s.signal, Fore.YELLOW)
-            sig_str = f"{clr}{s.signal}{Style.RESET_ALL}"
-            rows.append([s.name, f"{s.value:,.2f}", sig_str, s.detail])
-        print(tabulate(rows, headers=["Indikator","Nilai","Sinyal","Keterangan"],
-                       tablefmt="simple", colalign=("left","right","left","left")))
+    print("\n  ── Gerbang Konfluensi ─────────────────────────────────")
+    rows = []
+    for g in report.gates:
+        mark = (f"{Fore.GREEN}LOLOS{Style.RESET_ALL}" if g["passed"]
+                else f"{Fore.RED}GAGAL{Style.RESET_ALL}")
+        rows.append([g["name"], mark,
+                     f"{g['score']:.2f}" if g["passed"] else "-", g["detail"]])
+    print(tabulate(rows, headers=["Gerbang", "Status", "Skor", "Keterangan"],
+                   tablefmt="simple", colalign=("left", "left", "right", "left")))
+
+    print("\n  ── Nilai Komponen ─────────────────────────────────────")
+    rows = []
+    for s in report.signals:
+        c = SIG_COLOR.get(s.signal, Fore.YELLOW)
+        rows.append([s.name, f"{s.value:,.2f}",
+                     f"{c}{s.signal}{Style.RESET_ALL}", s.detail])
+    print(tabulate(rows, headers=["Komponen", "Nilai", "Baca", "Keterangan"],
+                   tablefmt="simple", colalign=("left", "right", "left", "left")))
 
     if report.resistance_levels:
         print(f"\n  Resistance: {' | '.join(f'${r:,.2f}' for r in report.resistance_levels)}")
     if report.support_levels:
         print(f"  Support   : {' | '.join(f'${s:,.2f}' for s in report.support_levels)}")
-
-    print("\n" + "═"*68 + "\n")
+    print("\n" + "═" * 68 + "\n")
 
 
 # ─────────────────────────────────────────────────────────
 #  ANALISIS MULTI-TIMEFRAME
 # ─────────────────────────────────────────────────────────
-
-# Mapping timeframe → jumlah candle dari data harian
-# Data kita adalah daily, jadi kita resample/simulasi TF pendek
-# dari data yang ada. TF < 1D diestimasi dari volatilitas harian.
+# ⚠️ PERINGATAN — data intraday di sini TIDAK NYATA.
+# Sumber brain masih yfinance harian, jadi TF < 1D "disimulasikan" dengan
+# menambahkan noise acak ke data harian (lihat _resample_to_tf). Sinyal 15m/30m/
+# 1H/4H dari sini adalah angka KARANGAN dan tidak boleh dipakai untuk keputusan.
+# Ini hilang begitu EA MQL5 mengirim OHLC asli per timeframe dari MT5.
 TIMEFRAMES = {
-    "15 Menit" : {"bars": 5,   "weight_vol": 0.30, "label": "15m"},
-    "30 Menit" : {"bars": 10,  "weight_vol": 0.28, "label": "30m"},
-    "1 Jam"    : {"bars": 20,  "weight_vol": 0.25, "label": "1H"},
-    "4 Jam"    : {"bars": 40,  "weight_vol": 0.20, "label": "4H"},
-    "1 Hari"   : {"bars": 60,  "weight_vol": 0.10, "label": "1D"},
-    "1 Minggu" : {"bars": 120, "weight_vol": 0.05, "label": "1W"},
-    "1 Bulan"  : {"bars": 250, "weight_vol": 0.03, "label": "1M"},
-    "1 Tahun"  : {"bars": 500, "weight_vol": 0.01, "label": "1Y"},
+    "15 Menit" : {"bars": 5,   "weight_vol": 0.30, "label": "15m", "synthetic": True},
+    "30 Menit" : {"bars": 10,  "weight_vol": 0.28, "label": "30m", "synthetic": True},
+    "1 Jam"    : {"bars": 20,  "weight_vol": 0.25, "label": "1H",  "synthetic": True},
+    "4 Jam"    : {"bars": 40,  "weight_vol": 0.20, "label": "4H",  "synthetic": True},
+    "1 Hari"   : {"bars": 60,  "weight_vol": 0.10, "label": "1D",  "synthetic": False},
+    "1 Minggu" : {"bars": 120, "weight_vol": 0.05, "label": "1W",  "synthetic": False},
+    "1 Bulan"  : {"bars": 250, "weight_vol": 0.03, "label": "1M",  "synthetic": False},
+    "1 Tahun"  : {"bars": 500, "weight_vol": 0.01, "label": "1Y",  "synthetic": False},
 }
 
+
 def _resample_to_tf(df: pd.DataFrame, bars: int, weight_vol: float) -> pd.DataFrame:
-    """
-    Simulasi timeframe lebih pendek dari data harian.
-    Untuk TF < 1D: tambahkan noise proporsional ke volatilitas harian (ATR).
-    Untuk TF >= 1D: slice n bar terakhir langsung.
+    """Ambil n bar terakhir; untuk TF < 1D tambahkan noise acak (SINTETIS!).
+
+    Lihat peringatan di atas TIMEFRAMES — cabang noise ini mengarang data.
     """
     n = min(bars, len(df))
     sliced = df.tail(n).copy()
 
     if weight_vol > 0.10:
-        # Simulasi intraday: tambah variasi kecil berdasarkan ATR harian
         atr_est = sliced["gold_close"].diff().abs().mean()
         noise_scale = atr_est * weight_vol
-        rng = np.random.default_rng(seed=42)  # seed tetap agar konsisten
+        rng = np.random.default_rng(seed=42)   # seed tetap agar konsisten
         noise = rng.normal(0, noise_scale, len(sliced))
-        sliced = sliced.copy()
         sliced["gold_close"] = (sliced["gold_close"] + noise).clip(lower=1)
-        sliced["gold_high"]  = sliced["gold_high"]  + abs(noise)
-        sliced["gold_low"]   = sliced["gold_low"]   - abs(noise)
+        sliced["gold_high"]  = sliced["gold_high"] + abs(noise)
+        sliced["gold_low"]   = sliced["gold_low"] - abs(noise)
 
     return sliced
 
 
-def analyze_multi_timeframe(df: pd.DataFrame) -> list:
-    """Jalankan analisis teknikal untuk setiap timeframe."""
+def analyze_multi_timeframe(df: pd.DataFrame, mode: str = "swing") -> list:
+    """Jalankan gerbang strategi untuk tiap timeframe.
+
+    `synthetic: True` menandai TF yang datanya dikarang — diteruskan ke UI agar
+    pengguna tahu mana yang boleh dipercaya.
+    """
     results = []
     for tf_name, cfg in TIMEFRAMES.items():
+        base = {"timeframe": tf_name, "label": cfg["label"],
+                "synthetic": cfg["synthetic"]}
         try:
             tf_df = _resample_to_tf(df, cfg["bars"], cfg["weight_vol"])
             if len(tf_df) < 30:
                 continue
-            analyzer = TechnicalAnalyzer(tf_df)
-            report   = analyzer.get_signals()
+            rep = TechnicalAnalyzer(tf_df).get_signals(mode=mode)
             results.append({
-                "timeframe" : tf_name,
-                "label"     : cfg["label"],
-                "signal"    : report.overall_signal,
-                "confidence": report.confidence,
-                "buy"       : report.buy_count,
-                "sell"      : report.sell_count,
-                "neutral"   : report.neutral_count,
-                "price"     : report.current_price,
-                "rsi"       : next((s.value for s in report.signals if s.name == "RSI (14)"), 0),
-                "macd"      : next((s.value for s in report.signals if s.name == "MACD"), 0),
-                "adx"       : next((s.value for s in report.signals if s.name == "ADX"), 0),
+                **base,
+                "signal"     : rep.overall_signal,
+                "confidence" : rep.confidence,
+                "price"      : rep.current_price,
+                "direction"  : rep.direction,
+                "gates_pass" : sum(1 for g in rep.gates if g["passed"]),
+                "gates_total": len(rep.gates),
             })
-        except Exception as e:
-            results.append({"timeframe": tf_name, "label": cfg["label"],
-                            "signal": "ERROR", "confidence": 0,
-                            "buy": 0, "sell": 0, "neutral": 0,
-                            "price": 0, "rsi": 0, "macd": 0, "adx": 0})
+        except Exception:
+            results.append({**base, "signal": "ERROR", "confidence": 0,
+                            "price": 0, "direction": None,
+                            "gates_pass": 0, "gates_total": 0})
     return results
 
 
 def print_multi_timeframe_report(results: list, current_price: float):
-    """Tampilkan laporan multi-timeframe di terminal."""
-    SIG_COLOR = {
-        "BELI": Fore.GREEN, "BELI KUAT": Fore.GREEN,
-        "JUAL": Fore.RED,   "JUAL KUAT": Fore.RED,
-        "NETRAL": Fore.YELLOW, "ERROR": Fore.WHITE,
-    }
-    SIG_ICON = {
-        "BELI": "▲", "BELI KUAT": "▲▲",
-        "JUAL": "▼", "JUAL KUAT": "▼▼",
-        "NETRAL": "◆", "ERROR": "?",
-    }
-
-    print("\n" + "═"*78)
-    print(f"  {'ANALISIS MULTI-TIMEFRAME — FULENS':^74}")
+    print("\n" + "═" * 78)
+    print(f"  {'SETUP MULTI-TIMEFRAME — FULENS':^74}")
     print(f"  {'Harga Referensi: $' + f'{current_price:,.2f}':^74}")
-    print("═"*78)
+    print("═" * 78)
 
-    # Hitung konsensus keseluruhan
     buy_tfs  = [r for r in results if "BELI" in r["signal"]]
     sell_tfs = [r for r in results if "JUAL" in r["signal"]]
     neu_tfs  = [r for r in results if r["signal"] == "NETRAL"]
 
     rows = []
     for r in results:
-        clr     = SIG_COLOR.get(r["signal"], Fore.WHITE)
-        icon    = SIG_ICON.get(r["signal"], "?")
-        sig_str = f"{clr}{icon} {r['signal']}{Style.RESET_ALL}"
-        conf    = f"{r['confidence']*100:.0f}%"
-        bsn     = f"{r['buy']}B / {r['sell']}J / {r['neutral']}N"
-        rsi_str = f"{r['rsi']:.1f}" if r['rsi'] else "-"
-        adx_str = f"{r['adx']:.1f}" if r['adx'] else "-"
-        rows.append([r["timeframe"], r["label"], sig_str, conf, bsn, rsi_str, adx_str])
+        clr = SIG_COLOR.get(r["signal"], Fore.WHITE)
+        flag = (f"{Fore.YELLOW}sintetis{Style.RESET_ALL}"
+                if r.get("synthetic") else "asli")
+        rows.append([r["timeframe"], r["label"],
+                     f"{clr}{r['signal']}{Style.RESET_ALL}",
+                     f"{r['confidence'] * 100:.0f}%",
+                     f"{r['gates_pass']}/{r['gates_total']}", flag])
+    print(tabulate(rows,
+                   headers=["Timeframe", "TF", "Sinyal", "Kualitas", "Gerbang", "Data"],
+                   tablefmt="simple",
+                   colalign=("left", "center", "left", "center", "center", "left")))
 
-    print(tabulate(
-        rows,
-        headers=["Timeframe", "TF", "Sinyal", "Konfiden", "B/J/N", "RSI", "ADX"],
-        tablefmt="simple",
-        colalign=("left","center","left","center","center","right","right")
-    ))
-
-    # Ringkasan konsensus
-    print("\n" + "─"*78)
-    total_tf = len(results)
+    print("\n" + "─" * 78)
     print(f"  Konsensus  : {Fore.GREEN}{len(buy_tfs)} Bullish{Style.RESET_ALL} | "
           f"{Fore.RED}{len(sell_tfs)} Bearish{Style.RESET_ALL} | "
           f"{Fore.YELLOW}{len(neu_tfs)} Netral{Style.RESET_ALL}  "
-          f"(dari {total_tf} timeframe)")
-
-    # Tentukan bias keseluruhan
-    if len(buy_tfs) > len(sell_tfs) * 1.5:
-        bias = f"{Fore.GREEN}BULLISH DOMINAN{Style.RESET_ALL}"
-        saran = "Tren naik mendominasi di mayoritas timeframe. Waspadai resistensi."
-    elif len(sell_tfs) > len(buy_tfs) * 1.5:
-        bias = f"{Fore.RED}BEARISH DOMINAN{Style.RESET_ALL}"
-        saran = "Tekanan jual kuat di mayoritas timeframe. Waspadai support."
-    else:
-        bias = f"{Fore.YELLOW}MIXED / KONSOLIDASI{Style.RESET_ALL}"
-        saran = "Sinyal bertentangan antar timeframe. Tunggu konfirmasi arah."
-
-    print(f"  Bias       : {bias}")
-    print(f"  Analisis   : {saran}")
-
-    # Saran per kelompok TF
-    print("\n  ── Ringkasan per Kelompok ─────────────────────────────────────────")
-    short_tfs  = [r for r in results if r["label"] in ["15m","30m","1H"]]
-    mid_tfs    = [r for r in results if r["label"] in ["4H","1D"]]
-    long_tfs   = [r for r in results if r["label"] in ["1W","1M","1Y"]]
-
-    def group_bias(group):
-        b = sum(1 for r in group if "BELI" in r["signal"])
-        s = sum(1 for r in group if "JUAL" in r["signal"])
-        if b > s: return f"{Fore.GREEN}Bullish{Style.RESET_ALL}"
-        if s > b: return f"{Fore.RED}Bearish{Style.RESET_ALL}"
-        return f"{Fore.YELLOW}Netral{Style.RESET_ALL}"
-
-    print(f"  Jangka Pendek (15m–1H) : {group_bias(short_tfs)}"
-          f"  → Cocok untuk scalping/intraday")
-    print(f"  Jangka Menengah (4H–1D): {group_bias(mid_tfs)}"
-          f"  → Cocok untuk swing trading")
-    print(f"  Jangka Panjang  (1W–1Y): {group_bias(long_tfs)}"
-          f"  → Cocok untuk posisi/investasi")
-
-    print("\n" + "═"*78 + "\n")
+          f"(dari {len(results)} timeframe)")
+    print(f"  {Fore.YELLOW}Catatan{Style.RESET_ALL}    : baris 'sintetis' memakai "
+          f"data harian + noise acak — jangan dipakai untuk keputusan.")
+    print("\n" + "═" * 78 + "\n")
 
 
 # ─────────────────────────────────────────────────────────
@@ -585,14 +517,12 @@ if __name__ == "__main__":
         df = run_pipeline()
 
     if df is not None and not df.empty:
-        # ── Laporan indikator standar (1D)
         analyzer = TechnicalAnalyzer(df)
-        report   = analyzer.get_signals()
-        print_report(report)
+        for m in ("swing", "scalping"):
+            print_report(analyzer.get_signals(mode=m))
 
-        # ── Laporan multi-timeframe
-        print("Menghitung analisis multi-timeframe...")
-        mtf_results = analyze_multi_timeframe(df)
-        print_multi_timeframe_report(mtf_results, report.current_price)
+        print("Menghitung setup multi-timeframe...")
+        mtf = analyze_multi_timeframe(df)
+        print_multi_timeframe_report(mtf, float(df["gold_close"].iloc[-1]))
     else:
         print("Gagal memuat data.")

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/LENOVO/AppData/Local/Temp/claude/c--Users-LENOVO-New-Fulens/f5cce3ae-34ee-439f-86db-9dc4541d8de8/scratchpad/uji_swing.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/LENOVO/AppData/Local/Temp/claude/c--Users-LENOVO-New-Fulens/f5cce3ae-34ee-439f-86db-9dc4541d8de8/scratchpad/uji_scalp_seimbang.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 180 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 500 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 560 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 300 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/LENOVO/AppData/Local/Temp/claude/c--Users-LENOVO-New-Fulens/f5cce3ae-34ee-439f-86db-9dc4541d8de8/scratchpad/cek_mq5.py\")"
+    ]
+  }
+}

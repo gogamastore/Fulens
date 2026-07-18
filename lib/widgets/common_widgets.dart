@@ -2,6 +2,156 @@
 import 'package:flutter/material.dart';
 import 'package:shimmer/shimmer.dart';
 import '../core/theme.dart';
+import '../services/api_service.dart' show GateResult;
+
+// ── GATE CHECKLIST ───────────────────────────────────────
+/// Checklist gerbang konfluensi — pengganti kotak "N indikator memilih beli".
+///
+/// Strategi FuLens adalah rantai AND, bukan pemungutan suara: satu gerbang
+/// gagal, tidak ada entry. Jadi angka "9 beli vs 3 jual" tak punya arti; yang
+/// berguna adalah melihat gerbang mana yang menahan setup.
+class GateChecklist extends StatelessWidget {
+  final List<GateResult> gates;
+  /// Tandai gerbang wajib pertama yang gagal sebagai "penahan".
+  final bool highlightBlocker;
+
+  const GateChecklist(this.gates, {super.key, this.highlightBlocker = true});
+
+  @override
+  Widget build(BuildContext context) {
+    if (gates.isEmpty) {
+      return const Text(
+        'Belum ada data gerbang.',
+        style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
+      );
+    }
+
+    GateResult? blocker;
+    if (highlightBlocker) {
+      for (final g in gates) {
+        if (!g.informational && !g.passed) { blocker = g; break; }
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final g in gates)
+          _GateRow(gate: g, isBlocker: identical(g, blocker)),
+      ],
+    );
+  }
+}
+
+class _GateRow extends StatelessWidget {
+  final GateResult gate;
+  final bool isBlocker;
+
+  const _GateRow({required this.gate, required this.isBlocker});
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color;
+    final IconData icon;
+    if (gate.informational) {
+      // Dihitung & dilaporkan, tapi tidak memblokir — jangan diwarnai merah,
+      // supaya tidak terbaca sebagai kegagalan.
+      color = AppColors.textSecondary;
+      icon  = Icons.info_outline;
+    } else if (gate.passed) {
+      color = AppColors.green;
+      icon  = Icons.check_circle_outline;
+    } else {
+      color = isBlocker ? AppColors.red : AppColors.textSecondary;
+      icon  = Icons.cancel_outlined;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 1),
+            child: Icon(icon, size: 16, color: color),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  Flexible(
+                    child: Text(gate.name, style: TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600,
+                      color: gate.informational
+                          ? AppColors.textSecondary : AppColors.textPrimary,
+                    )),
+                  ),
+                  if (gate.informational) ...[
+                    const SizedBox(width: 6),
+                    _tag('info', AppColors.textSecondary),
+                  ],
+                  if (isBlocker) ...[
+                    const SizedBox(width: 6),
+                    _tag('penahan', AppColors.red),
+                  ],
+                ]),
+                if (gate.detail.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(gate.detail, style: const TextStyle(
+                    fontSize: 11, color: AppColors.textSecondary, height: 1.35,
+                  )),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Widget _tag(String text, Color c) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+    decoration: BoxDecoration(
+      color: c.withValues(alpha: 0.13),
+      borderRadius: BorderRadius.circular(3),
+    ),
+    child: Text(text, style: TextStyle(
+      fontSize: 9, color: c, fontWeight: FontWeight.w700,
+    )),
+  );
+}
+
+/// Ringkasan satu baris: "3/4 gerbang · ditahan Divergence".
+class GateSummaryLine extends StatelessWidget {
+  final int passed, total;
+  final String? blockerName;
+
+  const GateSummaryLine({
+    super.key, required this.passed, required this.total, this.blockerName,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ok = total > 0 && passed == total;
+    return Row(children: [
+      Icon(ok ? Icons.check_circle : Icons.pending_outlined,
+        size: 14, color: ok ? AppColors.green : AppColors.textSecondary),
+      const SizedBox(width: 6),
+      Text('$passed/$total gerbang',
+        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+          color: ok ? AppColors.green : AppColors.textSecondary)),
+      if (blockerName != null) ...[
+        const Text(' · ', style: TextStyle(
+          fontSize: 12, color: AppColors.textSecondary)),
+        Flexible(child: Text('ditahan $blockerName',
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 12, color: AppColors.red))),
+      ],
+    ]);
+  }
+}
 
 // ── CARD CONTAINER ───────────────────────────────────────
 class AppCard extends StatelessWidget {

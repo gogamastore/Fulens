@@ -1,16 +1,25 @@
-"""Mesin sinyal multi-simbol & multi-timeframe (TA + ML per simbol).
+"""Mesin sinyal multi-simbol & multi-timeframe (konfluensi 4 komponen + ML veto).
 
-Menyediakan sinyal / indikator / harga / history untuk SEMUA simbol dengan
-TechnicalAnalyzer & analyze_multi_timeframe. Bila tersedia model ML per simbol
-(ml_symbol), arah & confidence di-blend dengan probabilitas ML.
+Arah keputusan datang SEPENUHNYA dari gerbang konfluensi di `strategy.py`
+(Bollinger Bands, S&R, Stochastic, MACD). Model ML per simbol (ml_symbol) TIDAK
+lagi ikut menentukan arah — ia turun pangkat jadi VETO: bila probabilitasnya
+melawan arah setup dengan cukup yakin, entry diblokir; bila cuma ragu-ragu,
+confidence dipotong.
 
-Bentuk output tetap kompatibel dengan model Flutter yang ada.
+Kenapa berubah: dulu `final = 0.5 * ta_score + 0.5 * ml_score`, di mana ta_score
+adalah rasio suara 16 indikator. Dua-duanya bermasalah. Rasio suara itu
+anti-reversal (lihat strategy.py), dan mencampur skor kontinu dari dua sumber
+membuat tak ada satu pun kondisi yang benar-benar wajib — persis yang bikin
+sinyalnya terasa lembek. Sekarang gerbang yang memutuskan, ML yang menyaring.
+
+Bentuk output tetap kompatibel dengan model Flutter & executor yang ada.
 """
 import logging
 from datetime import datetime
 
 import pandas as pd
 
+import config
 import market_data
 import ml_symbol
 import symbols as sym
@@ -18,6 +27,23 @@ import timeframes as tfmod
 from indicators import TechnicalAnalyzer, analyze_multi_timeframe
 
 log = logging.getLogger("signal_engine")
+
+# Mode per timeframe. M15/M30 = scalping (squeeze breakout), sisanya swing
+# (divergence di Major S&R). Bisa dioverride lewat argumen `mode`.
+_SCALP_TFS = {"M1", "M5", "M15", "M30"}
+
+
+def _resolve_mode(tf: str, mode: str | None) -> str:
+    """Mode efektif. None/"auto" → dipilih dari timeframe; selain itu dipakai apa
+    adanya (tapi divalidasi — nilai asing jatuh ke auto, bukan meledak)."""
+    m = (mode or "auto").strip().lower()
+    if m in ("scalping", "swing"):
+        return m
+    return "scalping" if tfmod.normalize(tf) in _SCALP_TFS else "swing"
+
+
+def _mode_for(tf: str) -> str:
+    return _resolve_mode(tf, None)
 
 
 def _analyzer(symbol: str, tf: str):
@@ -31,20 +57,35 @@ def price(symbol: str, tf: str = "D1") -> dict | None:
     return market_data.latest_price(symbol, tf)
 
 
-def indicators(symbol: str, tf: str = "D1") -> dict | None:
+def indicators(symbol: str, tf: str = "D1", mode: str | None = None) -> dict | None:
     an = _analyzer(symbol, tf)
     if not an:
         return None
-    report = an.get_signals()
+    mode = _resolve_mode(tf, mode)
+    report = an.get_signals(mode=mode)
+    # `current_price` = harga BAR YANG DIANALISIS (bar tertutup terakhir) — itulah
+    # dasar semua gerbang, jadi ia harus dipakai saat membandingkan dengan S&R.
+    # `live_price` = baris terakhir data (bar berjalan) — ini yang mendekati harga
+    # di terminal MT5. Keduanya dikirim supaya UI tak lagi menyebut harga bar
+    # tertutup sebagai "harga saat ini" (sumber kebingungan harga tak cocok).
+    live = float(an.close.iloc[-1]) if len(an.close) else report.current_price
     return {
         "symbol": sym.normalize(symbol),
         "timeframe": tfmod.normalize(tf),
         "timestamp": report.timestamp,
         "current_price": report.current_price,
+        "live_price": round(live, 5),
         "overall_signal": report.overall_signal,
         "confidence": round(report.confidence * 100, 1),
-        "summary": {"buy": report.buy_count, "sell": report.sell_count,
-                    "neutral": report.neutral_count},
+        "mode": report.mode,
+        "direction": report.direction,
+        # Arah yang sedang didiagnosa saat belum ada setup (paling dekat lolos).
+        "probe_direction": report.probe_direction,
+        # Inti laporan sekarang: checklist gerbang, bukan hitungan suara.
+        "gates": report.gates,
+        # Ringkasan lama (buy/sell/neutral) sengaja tidak dikirim lagi — dengan
+        # gerbang AND angka itu tak bermakna. Kotak "Ringkasan Sinyal" di
+        # technical_screen.dart perlu diganti jadi checklist gerbang.
         "signals": [
             {"name": s.name, "value": round(s.value, 5) if s.value else 0,
              "signal": s.signal, "category": s.category, "detail": s.detail}
@@ -55,48 +96,89 @@ def indicators(symbol: str, tf: str = "D1") -> dict | None:
     }
 
 
-def _label(score: float) -> str:
-    """score in [-1,1] → label sinyal."""
-    if score > 0.6:
-        return "BELI KUAT"
-    if score > 0.15:
-        return "BELI"
-    if score < -0.6:
-        return "JUAL KUAT"
-    if score < -0.15:
-        return "JUAL"
-    return "NETRAL"
+def _ml_veto(direction: str, ml_prob: float) -> tuple[bool, float, str]:
+    """ML sebagai penyaring, bukan penentu arah.
+
+    `ml_prob` = probabilitas naik (0..1). Kembalikan (lolos, faktor, alasan).
+    Faktor mengalikan quality — setup yang ML-nya ragu tetap boleh jalan tapi
+    confidence-nya turun, sehingga `min_confidence` di executor otomatis jadi
+    saringan kedua tanpa aturan tambahan.
+    """
+    p = config.ML_VETO
+    agree = ml_prob if direction == "BUY" else 1.0 - ml_prob
+
+    if agree < p["BLOCK_BELOW"]:
+        return False, 0.0, (f"ML menolak: probabilitas searah {agree * 100:.0f}% "
+                            f"< {p['BLOCK_BELOW'] * 100:.0f}%")
+    if agree < p["FULL_ABOVE"]:
+        # Interpolasi linear antara faktor minimum dan 1.0.
+        span = p["FULL_ABOVE"] - p["BLOCK_BELOW"]
+        t = (agree - p["BLOCK_BELOW"]) / span if span > 0 else 1.0
+        factor = p["MIN_FACTOR"] + (1.0 - p["MIN_FACTOR"]) * t
+        return True, factor, f"ML ragu ({agree * 100:.0f}% searah) — kualitas dipotong"
+    return True, 1.0, f"ML setuju ({agree * 100:.0f}% searah)"
 
 
-def signal(symbol: str, tf: str = "D1") -> dict | None:
-    """Sinyal ringkas (TA + ML blend) untuk /signal — dipakai executor & app."""
+def signal(symbol: str, tf: str = "D1", mode: str | None = None) -> dict | None:
+    """Sinyal ringkas untuk /signal — dipakai executor & app."""
     an = _analyzer(symbol, tf)
     if not an:
         return None
-    report = an.get_signals()
 
-    denom = max(report.buy_count + report.sell_count, 1)
-    ta_score = (report.buy_count - report.sell_count) / denom
+    mode = _resolve_mode(tf, mode)
+    report = an.get_signals(mode=mode)
 
-    ml_prob = ml_symbol.predict_latest(symbol, tf) if ml_symbol.has_model(symbol, tf) else None
-    if ml_prob is not None:
-        ml_score = (ml_prob - 0.5) * 2          # [-1,1]
-        final = 0.5 * ta_score + 0.5 * ml_score
-        source = "ml+technical"
+    direction = report.direction
+    quality = report.confidence * 100          # 0..100
+    reasons = [f"{g['name']}: {g['detail']}" for g in report.gates if g["passed"]]
+    source = "technical"
+    ml_prob = None
+
+    if direction is not None:
+        ml_prob = (ml_symbol.predict_latest(symbol, tf)
+                   if ml_symbol.has_model(symbol, tf) else None)
+        if ml_prob is not None:
+            source = "ml-veto+technical"
+            ok, factor, why = _ml_veto(direction, ml_prob)
+            reasons.append(why)
+            if not ok:
+                direction, quality = None, 0.0
+            else:
+                quality = round(quality * factor, 1)
     else:
-        final = ta_score
-        source = "technical"
+        # Tak ada setup: jelaskan gerbang mana yang menahannya.
+        reasons = [f"{g['name']}: {g['detail']}"
+                   for g in report.gates if not g["passed"]] or ["belum ada setup"]
 
-    conf = round(min(abs(final), 1.0) * 100, 1)
+    # Label harus dihitung ulang: faktor ML bisa menurunkan quality melewati
+    # ambang KUAT, dan executor membaca substring "KUAT" untuk require_strong.
+    import strategy
+    label = strategy._label(direction, quality)
+
+    # Mekanika risiko: jarak SL/TP dari ATR (harga). EA memakainya untuk lot &
+    # penempatan order. Arah & jarak = otak; ukuran lot (butuh equity) = EA.
+    atr = report.atr
+    sl_distance = round(atr * config.RISK_PARAMS["SL_ATR_MULT"], 5) if atr else None
+    tp_distance = round(atr * config.RISK_PARAMS["TP_ATR_MULT"], 5) if atr else None
+
     return {
         "symbol": sym.normalize(symbol),
         "timeframe": tfmod.normalize(tf),
         "timestamp": datetime.now().isoformat(),
         "current_price": report.current_price,
-        "signal": _label(final),
-        "confidence": conf,
-        "indicator_summary": {"buy": report.buy_count, "sell": report.sell_count,
-                              "neutral": report.neutral_count},
+        "signal": label,
+        "confidence": round(quality, 1),
+        "mode": mode,
+        "direction": direction,
+        # Arah yang gerbangnya sedang ditampilkan saat belum ada setup — supaya
+        # log keputusan di Flutter tidak disalahartikan (checklist itu diagnosa
+        # satu arah, bukan bukti indikatornya rusak).
+        "probe_direction": report.probe_direction,
+        "gates": report.gates,
+        "reasons": reasons,
+        "atr": round(atr, 5) if atr else None,
+        "sl_distance": sl_distance,
+        "tp_distance": tp_distance,
         "ml_probability": round(ml_prob * 100, 1) if ml_prob is not None else None,
         "prediction_1d": None,
         "prediction_7d": None,
@@ -110,7 +192,7 @@ def multitimeframe(symbol: str, tf: str = "D1") -> dict | None:
     df = market_data.get_ohlc(symbol, tf)
     if df is None or len(df) < 60:
         return None
-    results = analyze_multi_timeframe(df)
+    results = analyze_multi_timeframe(df, mode=_mode_for(tf))
     buy_tfs = sum(1 for r in results if "BELI" in r["signal"])
     sell_tfs = sum(1 for r in results if "JUAL" in r["signal"])
     return {

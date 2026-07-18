@@ -12,7 +12,7 @@ class SymbolState extends ChangeNotifier {
 
   final _api = ApiService();
   List<SymbolInfo> symbols = [];
-  List<String> timeframes = const ['M15', 'M30', 'H1', 'H4', 'D1', 'W1'];
+  List<String> timeframes = const ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'];
   bool loaded = false;
 
   String get symbol => selectedSymbol;

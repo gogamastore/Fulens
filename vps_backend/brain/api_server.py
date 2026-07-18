@@ -12,9 +12,12 @@ warnings.filterwarnings("ignore")
 
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger("api_server")
 
 import numpy as np
 import pandas as pd
@@ -27,7 +30,8 @@ import uvicorn
 import config
 from data_pipeline import load_processed_data, run_pipeline, load_latest_price
 from features import build_feature_set, get_feature_columns
-from indicators import TechnicalAnalyzer, analyze_multi_timeframe
+# indicators/strategy tidak lagi dipanggil langsung dari sini — semua endpoint
+# analisis lewat signal_engine supaya cuma ada SATU jalur keputusan.
 
 # Multi-simbol (forex/crypto/komoditas) — TA + ML per simbol, multi-timeframe.
 import symbols
@@ -35,15 +39,14 @@ import timeframes
 import signal_engine
 import backtest_engine
 import market_data
+import mt5_feed
 import ml_symbol
 from fastapi import BackgroundTasks
 
-
-def _use_engine(symbol: str, tf: str = "D1") -> bool:
-    """Pakai signal_engine multi-simbol bila bukan emas ATAU bukan timeframe D1.
-    Emas pada D1 tetap memakai pipeline ML ensemble lama."""
-    return (symbols.normalize(symbol) != symbols.DEFAULT
-            or timeframes.normalize(tf) != "D1")
+# Catatan: dulu ada `_use_engine()` yang mengecualikan emas/D1 ke rumus sendiri
+# (ind_score×0.5 + pred_score×0.5) — skema pencampuran ketiga yang justru mengenai
+# kombinasi default executor. Sudah dihapus; SEMUA simbol/timeframe kini lewat
+# signal_engine (satu jalur keputusan: gerbang konfluensi).
 
 # ─────────────────────────────────────────────────────────
 #  CEK MODEL TERSEDIA
@@ -345,39 +348,13 @@ def root():
 # ── HARGA REALTIME ────────────────────────────────────────
 @app.get("/api/v1/price", tags=["Harga"])
 def get_price(symbol: str = symbols.DEFAULT, timeframe: str = "D1"):
-    """Harga terkini simbol. Emas D1 memakai pipeline lengkap; lainnya via yfinance."""
+    """Harga terkini simbol (dari data EA bila ada, jika tidak yfinance)."""
     if not symbols.exists(symbol):
         raise HTTPException(400, f"Simbol tidak dikenal: {symbol}")
-    if _use_engine(symbol, timeframe):
-        data = signal_engine.price(symbol, timeframe)
-        if not data:
-            raise HTTPException(503, "Data belum tersedia")
-        return data
-
-    load_data_cache()
-    df = _cache.get("df")
-    if df is None:
+    data = signal_engine.price(symbol, timeframe)
+    if not data:
         raise HTTPException(503, "Data belum tersedia")
-
-    latest = df.iloc[-1]
-    prev   = df.iloc[-2]
-    chg    = float(latest["gold_close"]) - float(prev["gold_close"])
-
-    return {
-        "timestamp"   : str(df.index[-1].date()),
-        "price"       : round(float(latest["gold_close"]), 2),
-        "open"        : round(float(latest.get("gold_open",  latest["gold_close"])), 2),
-        "high"        : round(float(latest.get("gold_high",  latest["gold_close"])), 2),
-        "low"         : round(float(latest.get("gold_low",   latest["gold_close"])), 2),
-        "change_usd"  : round(chg, 2),
-        "change_pct"  : round(chg / float(prev["gold_close"]) * 100, 2),
-        "dxy"         : round(float(latest["dxy"]),     2) if "dxy"     in latest and not pd.isna(latest["dxy"])     else None,
-        "vix"         : round(float(latest["vix"]),     2) if "vix"     in latest and not pd.isna(latest["vix"])     else None,
-        "bond10y"     : round(float(latest["bond10y"]), 2) if "bond10y" in latest and not pd.isna(latest["bond10y"]) else None,
-        "oil"         : round(float(latest["oil"]),     2) if "oil"     in latest and not pd.isna(latest["oil"])     else None,
-        "currency"    : "USD",
-        "unit"        : "per troy oz",
-    }
+    return data
 
 
 # ── PREDIKSI AI ────────────────────────────────────────────
@@ -445,81 +422,36 @@ def get_prediction(horizons: str = "1,3,7,14,30", symbol: str = symbols.DEFAULT)
 
 # ── INDIKATOR TEKNIKAL ─────────────────────────────────────
 @app.get("/api/v1/indicators", tags=["Teknikal"])
-def get_indicators(symbol: str = symbols.DEFAULT, timeframe: str = "D1"):
-    """Semua indikator teknikal beserta sinyal beli/jual/netral."""
+def get_indicators(symbol: str = symbols.DEFAULT, timeframe: str = "D1",
+                   mode: str = "auto"):
+    """Nilai 4 komponen + status gerbang konfluensi.
+
+    `mode`: "auto" (dipilih dari timeframe) / "scalping" / "swing".
+    """
     if not symbols.exists(symbol):
         raise HTTPException(400, f"Simbol tidak dikenal: {symbol}")
-    if _use_engine(symbol, timeframe):
-        data = signal_engine.indicators(symbol, timeframe)
-        if not data:
-            raise HTTPException(503, "Data belum tersedia")
-        return data
-
-    load_data_cache()
-    df = _cache.get("df")
-    if df is None:
+    data = signal_engine.indicators(symbol, timeframe, mode)
+    if not data:
         raise HTTPException(503, "Data belum tersedia")
-
-    analyzer = TechnicalAnalyzer(df)
-    report   = analyzer.get_signals()
-
-    return {
-        "timestamp"    : report.timestamp,
-        "current_price": report.current_price,
-        "overall_signal": report.overall_signal,
-        "confidence"   : round(report.confidence * 100, 1),
-        "summary"      : {
-            "buy"    : report.buy_count,
-            "sell"   : report.sell_count,
-            "neutral": report.neutral_count,
-        },
-        "signals": [
-            {
-                "name"    : s.name,
-                "value"   : round(s.value, 4) if s.value else 0,
-                "signal"  : s.signal,
-                "category": s.category,
-                "detail"  : s.detail,
-            }
-            for s in report.signals
-        ],
-        "support_levels"    : report.support_levels,
-        "resistance_levels" : report.resistance_levels,
-    }
+    return data
 
 
 # ── MULTI-TIMEFRAME ─────────────────────────────────────────
 @app.get("/api/v1/indicators/multitimeframe", tags=["Teknikal"])
 def get_multitimeframe(symbol: str = symbols.DEFAULT, timeframe: str = "D1"):
-    """Analisis sinyal untuk semua timeframe (15m hingga 1Y)."""
+    """Setup per timeframe (15m hingga 1Y).
+
+    Perhatikan flag `synthetic` di tiap baris: TF di bawah 1D datanya DIKARANG
+    (data harian + noise acak) karena brain masih bersumber yfinance harian —
+    lihat peringatan di indicators.TIMEFRAMES. Jangan dipakai untuk keputusan
+    sampai EA MQL5 mengirim OHLC asli per timeframe.
+    """
     if not symbols.exists(symbol):
         raise HTTPException(400, f"Simbol tidak dikenal: {symbol}")
-    if _use_engine(symbol, timeframe):
-        data = signal_engine.multitimeframe(symbol, timeframe)
-        if not data:
-            raise HTTPException(503, "Data belum tersedia")
-        return data
-
-    load_data_cache()
-    df = _cache.get("df")
-    if df is None:
+    data = signal_engine.multitimeframe(symbol, timeframe)
+    if not data:
         raise HTTPException(503, "Data belum tersedia")
-
-    results = analyze_multi_timeframe(df)
-    buy_tfs  = sum(1 for r in results if "BELI" in r["signal"])
-    sell_tfs = sum(1 for r in results if "JUAL" in r["signal"])
-
-    return {
-        "timestamp"  : datetime.now().isoformat(),
-        "timeframes" : results,
-        "consensus"  : {
-            "bullish": buy_tfs,
-            "bearish": sell_tfs,
-            "neutral": len(results) - buy_tfs - sell_tfs,
-            "bias"   : ("BULLISH" if buy_tfs > sell_tfs else
-                        "BEARISH" if sell_tfs > buy_tfs else "MIXED"),
-        }
-    }
+    return data
 
 
 # ── DATA FUNDAMENTAL ──────────────────────────────────────
@@ -571,88 +503,84 @@ def get_history(days: int = 90, symbol: str = symbols.DEFAULT, timeframe: str = 
     """
     if not symbols.exists(symbol):
         raise HTTPException(400, f"Simbol tidak dikenal: {symbol}")
-    if _use_engine(symbol, timeframe):
-        data = signal_engine.history(symbol, days, timeframe)
-        if not data:
-            raise HTTPException(503, "Data belum tersedia")
-        return data
-
-    load_data_cache()
-    df = _cache.get("df")
-    if df is None:
+    data = signal_engine.history(symbol, days, timeframe)
+    if not data:
         raise HTTPException(503, "Data belum tersedia")
-
-    days = min(days, 730)
-    df_slice = df.tail(days)
-
-    records = []
-    for dt, row in df_slice.iterrows():
-        records.append({
-            "date"  : str(dt.date()),
-            "open"  : round(float(row.get("gold_open",  row["gold_close"])), 2),
-            "high"  : round(float(row.get("gold_high",  row["gold_close"])), 2),
-            "low"   : round(float(row.get("gold_low",   row["gold_close"])), 2),
-            "close" : round(float(row["gold_close"]), 2),
-            "volume": int(row.get("gold_volume", 0)) if not pd.isna(row.get("gold_volume", 0)) else 0,
-        })
-
-    return {
-        "days"   : days,
-        "count"  : len(records),
-        "data"   : records,
-    }
+    return data
 
 
 # ── SINYAL RINGKAS ─────────────────────────────────────────
 @app.get("/api/v1/signal", tags=["Prediksi"])
-def get_signal(symbol: str = symbols.DEFAULT, timeframe: str = "D1"):
-    """Sinyal trading ringkas untuk tampilan di app & eksekutor."""
+def get_signal(symbol: str = symbols.DEFAULT, timeframe: str = "D1",
+               mode: str = "auto"):
+    """Sinyal trading ringkas untuk tampilan di app & eksekutor.
+
+    `mode`: "auto" (dipilih dari timeframe) / "scalping" / "swing".
+    """
     if not symbols.exists(symbol):
         raise HTTPException(400, f"Simbol tidak dikenal: {symbol}")
-    if _use_engine(symbol, timeframe):
-        data = signal_engine.signal(symbol, timeframe)
-        if not data:
-            raise HTTPException(503, "Data belum tersedia")
-        return data
-
-    load_data_cache()
-    df = _cache.get("df")
-    if df is None:
+    data = signal_engine.signal(symbol, timeframe, mode)
+    if not data:
         raise HTTPException(503, "Data belum tersedia")
 
-    # Indikator
-    analyzer = TechnicalAnalyzer(df)
-    report   = analyzer.get_signals()
+    # Prediksi ensemble (emas D1 saja — hanya simbol ini yang punya model LSTM+
+    # XGBoost terlatih). Dilampirkan sebagai INFORMASI untuk ditampilkan di app
+    # dan masuk ke `reasons` executor. Ia TIDAK ikut menentukan arah maupun
+    # confidence — itu tugas gerbang konfluensi + veto ml_symbol di signal_engine.
+    if (symbols.normalize(symbol) == symbols.DEFAULT
+            and timeframes.normalize(timeframe) == "D1"):
+        try:
+            load_data_cache()
+            preds = _make_predictions([1, 7]).get("predictions", {})
+            data["prediction_1d"] = preds.get("1", {}).get("change_pct")
+            data["prediction_7d"] = preds.get("7", {}).get("change_pct")
+        except Exception as e:
+            log.warning("Prediksi ensemble gagal dilampirkan: %s", e)
 
-    # Prediksi
-    pred_result = _make_predictions([1, 7])
-    preds = pred_result.get("predictions", {})
-    p1    = preds.get("1", {})
-    p7    = preds.get("7", {})
+    return data
 
-    # Gabungkan skor
-    ind_score  = (report.buy_count - report.sell_count) / max(report.buy_count + report.sell_count, 1)
-    pred_score = (p1.get("change_pct", 0) / 3.0 + p7.get("change_pct", 0) / 5.0)
-    final_score = ind_score * 0.5 + pred_score * 0.5
-    confidence  = min(abs(final_score), 1.0) * 100
 
-    if final_score > 0.3:   signal = "BELI KUAT" if final_score > 0.6 else "BELI"
-    elif final_score < -0.3: signal = "JUAL KUAT" if final_score < -0.6 else "JUAL"
-    else:                    signal = "NETRAL"
+# ── INGESTION OHLC DARI EA (mata) ──────────────────────────
+class OhlcBar(BaseModel):
+    time: float | str        # epoch detik atau ISO string
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
 
+
+class OhlcPush(BaseModel):
+    symbol: str
+    timeframe: str
+    bars: list[OhlcBar]
+
+
+@app.post("/api/v1/ohlc", tags=["Data"])
+def push_ohlc(payload: OhlcPush):
+    """Terima bar OHLC yang didorong EA dari terminal MT5.
+
+    Begitu data ini masuk, market_data.get_ohlc memilihnya lebih dulu daripada
+    yfinance — seluruh otak (gerbang, S&R, ML) beralih ke harga broker asli.
+    EA sebaiknya mengirim ≥150 bar tertutup terakhir agar indikator (squeeze
+    percentile butuh 100, S&R butuh histori) punya cukup data.
+    """
+    if not symbols.exists(payload.symbol):
+        raise HTTPException(400, f"Simbol tidak dikenal: {payload.symbol}")
+    bars = [b.model_dump() for b in payload.bars]
+    stored = mt5_feed.ingest(payload.symbol, payload.timeframe, bars)
     return {
-        "timestamp"    : datetime.now().isoformat(),
-        "current_price": report.current_price,
-        "signal"       : signal,
-        "confidence"   : round(confidence, 1),
-        "indicator_summary": {
-            "buy": report.buy_count, "sell": report.sell_count, "neutral": report.neutral_count,
-        },
-        "prediction_1d": p1.get("change_pct"),
-        "prediction_7d": p7.get("change_pct"),
-        "support"      : report.support_levels[:2],
-        "resistance"   : report.resistance_levels[:2],
+        "symbol": symbols.normalize(payload.symbol),
+        "timeframe": timeframes.normalize(payload.timeframe),
+        "received": len(bars),
+        "stored": stored,
     }
+
+
+@app.get("/api/v1/ohlc/status", tags=["Data"])
+def ohlc_status():
+    """Key OHLC-EA yang terisi + umur & jumlah bar (untuk cek EA masih mengirim)."""
+    return {"feeds": mt5_feed.status()}
 
 
 # ── REFRESH DATA ───────────────────────────────────────────

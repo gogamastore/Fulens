@@ -13,6 +13,7 @@ import warnings
 import pandas as pd
 import yfinance as yf
 
+import mt5_feed
 import symbols as sym
 import timeframes as tfmod
 
@@ -138,6 +139,15 @@ def get_ohlc(symbol: str, timeframe: str = "D1",
       • cache basi   → sajikan yang LAMA sekarang, perbarui di latar belakang;
       • belum ada    → terpaksa menunggu (sekali saja; ditutup oleh prewarm()).
     """
+    # ── Prioritas: OHLC dorongan EA (harga broker asli) ──────────────
+    # Hanya untuk data HIDUP (start/end kosong). Permintaan rentang tanggal
+    # spesifik — mis. backtest — tetap ke yfinance karena EA hanya mengirim
+    # jendela bar terakhir, bukan histori sembarang tanggal.
+    if start is None and end is None:
+        fed = mt5_feed.get(symbol, timeframe)
+        if fed is not None and len(fed) >= 60:
+            return fed
+
     ticker = sym.yf_ticker(symbol)
     if not ticker:
         log.warning("Simbol tak dikenal: %s", symbol)

@@ -13,7 +13,7 @@ import json
 import logging
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 log = logging.getLogger("config")
 
@@ -26,19 +26,44 @@ class BotSettings(BaseModel):
         "AUDUSD", "BTCUSD", "ETHUSD",
     ]
 
-    # ── Mode eksekusi ────────────────────────────────────────────────
-    # "auto"     : eksekusi sinyal untuk SEMUA simbol di `symbols`.
-    # "selected" : hanya eksekusi `selected_symbol` (fokus satu simbol).
-    execution_mode: str = "auto"
-    selected_symbol: str = "XAUUSD"
+    # ── Timeframe EKSEKUSI (DIPILIH DARI FLUTTER) ────────────────────
+    # EA mendorong OHLC untuk BANYAK timeframe (jadi semua layar analisis memakai
+    # harga broker asli, bukan yfinance). Tapi yang DIEKSEKUSI hanya SATU — yang
+    # dipilih di sini. Jadi kontrolnya satu tempat: aplikasi.
+    #
+    # Ini menggantikan `signal_timeframe` lama DAN input `SignalTF` di EA yang
+    # dulu diam-diam menentukan timeframe keputusan. Dua sumber kebenaran itu
+    # yang bikin layar menampilkan gerbang M1 sementara bot menilai H1.
+    exec_timeframe: str = "M15"
 
-    # Timeframe sinyal FuLens yang diikuti bot (M15/M30/H1/H4/D1/W1).
-    # Sinyal & arah dihitung otak pada timeframe ini.
-    signal_timeframe: str = "D1"
+    # ── Mode strategi otak (DIPILIH DARI FLUTTER) ────────────────────
+    # Otak punya dua rantai gerbang (lihat brain/strategy.py):
+    #   • "swing"    → Stochastic cross → Tren EMA200 → Sentuh S&R
+    #                  Ikut tren besar; BUY-only saat uptrend, SELL-only saat
+    #                  downtrend. Itu memang maksudnya.
+    #   • "scalping" → Stochastic cross → BB Squeeze
+    #                  Tidak peduli tren; seimbang BUY/SELL, cari profit harian.
+    #   • "auto"     → otak memilih dari timeframe (M1/M5/M15/M30 → scalping).
+    #
+    # Mode berlaku untuk SEMUA simbol. Simbol mana yang ditradingkan ditentukan
+    # oleh chart tempat EA dipasang — bukan oleh setelan di sini. Karena itu
+    # `execution_mode`/`selected_symbol` lama DIHAPUS: dengan EA per-chart,
+    # konsep "auto semua simbol" vs "fokus satu simbol" tak lagi relevan.
+    trading_mode: str = "swing"
 
     # ── Gerbang keputusan dari FuLens ────────────────────────────────
     # Sinyal FuLens: "BELI KUAT" / "BELI" / "NETRAL" / "JUAL" / "JUAL KUAT".
-    min_confidence: float = 50.0      # confidence minimum FuLens (0-100) untuk entry
+    # Ambang kualitas setup, DIATUR DARI FLUTTER. Dibatasi 50-95 karena dengan
+    # gerbang AND skor selalu >= 50 (quality = 50 + 50 x rata-rata skor gerbang),
+    # jadi nilai < 50 tak bermakna dan > 95 praktis mematikan bot.
+    #
+    # PERINGATAN TERUKUR: menaikkannya MEMPERBURUK hasil, bukan memperbaiki.
+    # Skor kualitas mengukur "seberapa baik syarat dipenuhi", BUKAN "seberapa
+    # besar peluang profit" — dan uji ke depan menunjukkan keduanya tidak
+    # berkorelasi. Scalping: 50%→+0.31R, 60%→+0.25R, 70%→+0.14R, 75%→-0.05R
+    # (sambil membuang 80% peluang). Swing: skor selalu 76-98 jadi ambang < 75
+    # tak berefek. Biarkan 50 kecuali kamu memang ingin lebih sedikit transaksi.
+    min_confidence: float = Field(default=50.0, ge=50.0, le=95.0)
     require_strong: bool = False      # True = hanya entry pada "BELI KUAT"/"JUAL KUAT"
     close_on_neutral: bool = True     # tutup posisi saat FuLens berubah NETRAL
     close_on_flip: bool = True        # tutup posisi lama saat arah FuLens berbalik
@@ -61,57 +86,30 @@ class BotSettings(BaseModel):
     scaling_mode: str = "pyramid"
     max_positions_per_symbol: int = 3  # jumlah entry maksimum per simbol
     add_step_atr: float = 0.5          # jarak (×ATR) antar entry bertahap
-    # TP entry tambahan MENGECIL tiap entry: entry-1 = tp_atr_mult (2.5),
-    # entry-2 = 2.0, entry-3 = 1.5, ... dibatasi min_tp_atr_mult.
+    # CATATAN: `scaling_mode`, `add_step_atr`, `tp_step_atr`, `min_tp_atr_mult`
+    # juga BELUM dibaca siapa pun — entry bertahap belum diimplementasikan ulang
+    # setelah bot_engine dicabut. Dibiarkan di sini sebagai rencana, TAPI jangan
+    # berharap mengubahnya mengubah perilaku bot. Saat ini: 1 entry per simbol.
     tp_step_atr: float = 0.5
     min_tp_atr_mult: float = 0.5
 
-    # ── Mode SCALPING (adaptif-rezim) ────────────────────────────────
-    # Aktif HANYA bila signal_timeframe == "M15" DAN execution_mode == "selected"
-    # (fokus satu simbol). Perannya FILTER: otak FuLens tetap penentu arah, gerbang
-    # ini cuma memblokir entry yang lokasi/kondisinya buruk. Lihat strategy/scalp.py.
-    scalp_enabled: bool = True
-    # Ruang minimum ke level lawan sebelum entry = mult × tp_atr_mult × ATR.
-    # Inti anti-danger-zone: BUY butuh ruang ke resisten, SELL butuh ruang ke support.
-    # Naikkan = lebih selektif (entry lebih jarang, tapi TP lebih realistis).
-    scalp_min_room_mult: float = 0.6
-    # Efficiency Ratio: ≥ nilai ini dianggap TRENDING (ikut tren), di bawahnya
-    # RANGING (mean-reversion di S/R). 0.3 = titik tengah yang umum dipakai.
-    scalp_er_trend: float = 0.30
-    # Saat TRENDING: entry ditolak bila harga sudah > nilai ini × ATR dari EMA50
-    # (dianggap mengejar; tunggu pullback).
-    scalp_ext_atr: float = 1.5
-    # Saat RANGING: "menempel level" = dalam jarak ini × ATR dari support/resisten.
-    scalp_near_atr: float = 1.0
-    # Volume minimum = mult × rata-rata tick_volume (partisipasi pasar).
-    scalp_vol_mult: float = 0.8
-    scalp_vol_period: int = 20
-
-    # ── Timing entry via Stochastic (HANYA timeframe M15) ────────────
-    # Di M15: walau sinyal valid, bot MENUNGGU momen —
-    #   SELL → %K ≥ stoch_upper (overbought); BUY → %K ≤ stoch_lower (oversold).
-    # Timeframe lain: entry mengikuti sinyal saja (tanpa gerbang stochastic).
-    entry_timing_enabled: bool = True
-    stoch_upper: float = 70.0
-    stoch_lower: float = 30.0
+    # Setelan lama `scalp_*` dan `entry_timing_*` DIHAPUS: keduanya milik
+    # strategy/scalp.py + bot_engine yang sudah dicabut. Peran filter lokasi kini
+    # ada di gerbang otak (Sentuh S&R untuk swing, BB Squeeze untuk scalping),
+    # dan timing Stochastic sudah jadi gerbang wajib di kedua mode.
 
     # ── Risk management (mekanika eksekusi, bukan keputusan) ─────────
     risk_percent: float = 0.5     # % equity yang dirisikokan per entry
-    atr_period: int = 14          # ATR dihitung dari rate MT5 untuk jarak SL/TP
-    # Timeframe sumber ATR untuk jarak SL/TP + trailing:
-    #  • "auto"  → IKUT timeframe yang dipilih pengguna di Flutter (signal_timeframe).
-    #              SL/TP menyesuaikan horizon trading: M15 rapat, D1 lebar.
-    #  • "M30"/"H1"/... → PIN ke satu timeframe, apa pun pilihan pengguna.
+
+    # DIHAPUS 2026-07-19: `atr_timeframe`, `atr_period`, `sl_atr_mult`,
+    # `tp_atr_mult`. Keempatnya KODE MATI — tak satu pun dibaca sejak
+    # risk_manager.py dicabut. Jarak SL/TP kini sepenuhnya dari otak
+    # (brain/config.py RISK_PARAMS, ATR dari timeframe yang dianalisis).
     #
-    # Soal "auto" di D1: ATR emas D1 ~$90 → SL 1.5×ATR ≈ $139. Itu WAJAR untuk swing
-    # D1 (butuh ruang napas) dan risiko TIDAK ikut membesar: lot dihitung dari
-    # sl_dist (lihat risk_manager.build_plan), jadi SL lebar → lot kecil → kerugian
-    # tetap risk_percent (0.5%) dari equity. Yang berubah cuma jarak, bukan risiko.
-    # Pin ke "M30"/"H1" HANYA jika ingin SL selalu rapat berapa pun timeframe-nya
-    # (konsekuensi: di sinyal D1, SL rapat lebih gampang kena noise → sering stop-out).
-    atr_timeframe: str = "auto"
-    sl_atr_mult: float = 1.5      # SL = 1.5 x ATR
-    tp_atr_mult: float = 2.5      # TP = 2.5 x ATR
+    # Kenapa dicabut, bukan dibiarkan: field mati yang kelihatan hidup itu
+    # menipu. `tp_atr_mult` di sini masih 2.5 sementara otak sudah memakai 2.0,
+    # dan pengguna sempat mengubah `atr_timeframe` "auto"->"M15" lalu heran
+    # kenapa SL/TP tidak berubah sama sekali. Satu sumber kebenaran: otak.
     trailing_enabled: bool = True
     trail_start_atr: float = 1.0  # mulai trailing setelah profit 1 x ATR
     trail_dist_atr: float = 1.0   # jarak trailing 1 x ATR
@@ -149,12 +147,11 @@ class ServerConfig:
     HOST = "93.127.140.99"
     PORT = 8000                                          # gerbang tunggal utk Flutter
     API_KEY = "CN9-5UB1TBJMD5wM_WR5dNiPr_Gbq9CXz6dt8Pa1spg"  # wajib diganti sebelum publik!
+    # Dipakai bertiga: Flutter (app_config.dart), EA (input ApiKey), dan cek WS.
 
-    # Login MT5 (kosongkan untuk memakai terminal yang sudah login)
-    MT5_LOGIN: int | None = None
-    MT5_PASSWORD: str | None = None
-    MT5_SERVER: str | None = None
-    MT5_PATH: str | None = None  # path terminal64.exe jika perlu
+    # Field login MT5 (MT5_LOGIN/PASSWORD/SERVER/PATH) DIHAPUS: gerbang tak lagi
+    # menyentuh MT5 — EA yang login & mengeksekusi di terminal. Kalau kode lama
+    # masih mencarinya, itu sisa yang sudah tidak relevan.
 
 
 # ── Penyimpanan setelan (agar pilihan bertahan setelah restart) ──────
@@ -175,8 +172,8 @@ def load_settings() -> BotSettings:
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         s = BotSettings(**data)
-        log.info("Setelan dimuat dari %s (timeframe=%s)",
-                 SETTINGS_FILE.name, s.signal_timeframe)
+        log.info("Setelan dimuat dari %s (mode=%s)",
+                 SETTINGS_FILE.name, s.trading_mode)
         return s
     except (json.JSONDecodeError, ValidationError, OSError, TypeError) as e:
         log.warning("Gagal baca %s (%s) — pakai default pabrik",

@@ -12,12 +12,17 @@ class TradingAdvisor {
     required IndicatorData indicators,
   }) {
     final cur = price.price;
-    final atr = _getIndicatorValue(indicators, 'ATR (14)') ?? cur * 0.008;
-    final rsi = _getIndicatorValue(indicators, 'RSI (14)') ?? 50.0;
-    final bb_upper = _getIndicatorValue(indicators, 'BB Atas') ?? cur * 1.02;
-    final bb_lower = _getIndicatorValue(indicators, 'BB Bawah') ?? cur * 0.98;
-    final ema20 = _getIndicatorValue(indicators, 'EMA 20') ?? cur;
-    final ema50 = _getIndicatorValue(indicators, 'EMA 50') ?? cur;
+    // Semua nilai di bawah HARUS ada di payload otak. Fallback-nya sengaja
+    // dibuat kentara, bukan angka yang terlihat masuk akal: dulu 'EMA 20' yang
+    // hilang diam-diam jatuh ke `cur`, sehingga advisor menyodorkan "support"
+    // tepat di harga sekarang dan `cur > ema20` selalu false → selamanya bilang
+    // "Death Stack". Fiksi yang terlihat meyakinkan lebih berbahaya daripada
+    // data kosong. RSI/EMA20/EMA50 sudah TIDAK ADA lagi — strateginya cuma 4
+    // komponen (BB, S&R, Stochastic, MACD), jadi advisor ikut memakai itu.
+    final atr      = _getIndicatorValue(indicators, 'ATR (14)') ?? cur * 0.008;
+    final bbUpper  = _getIndicatorValue(indicators, 'BB Atas');
+    final bbLower  = _getIndicatorValue(indicators, 'BB Bawah');
+    final stochK   = _getIndicatorValue(indicators, 'Stochastic %K');
 
     // Tentukan bias
     final isBullish = signal.signal.contains('BELI');
@@ -33,70 +38,69 @@ class TradingAdvisor {
     // ── ENTRY ZONES ──────────────────────────────────────
     final entries = <EntryZone>[];
 
+    // Zona entry dibangun dari level yang BENAR-BENAR dipakai bot: S&R dari
+    // pivot fractal dan Bollinger Band. Versi lama memakai EMA 20 sebagai
+    // "support dinamis utama" — indikator yang kini tak dihitung otak dan tak
+    // pernah dilihat bot saat memutuskan entry.
     if (isBullish || bias == 'NETRAL') {
-      // Entry 1: Di sekitar EMA 20 (support dinamis)
-      entries.add(EntryZone(
-        label: 'Entry Utama (Buy)',
-        type: 'BUY',
-        priceFrom: ema20 - atr * 0.3,
-        priceTo: ema20 + atr * 0.2,
-        strength: 'Kuat',
-        reason: 'Area EMA 20 sebagai support dinamis utama. '
-            'Harga sering rebound dari level ini pada tren bullish.',
-      ));
-
-      // Entry 2: Di Bollinger Band bawah (oversold area)
-      if (rsi < 45) {
-        entries.add(EntryZone(
-          label: 'Entry Agresif (Buy Dip)',
-          type: 'BUY',
-          priceFrom: bb_lower - atr * 0.1,
-          priceTo: bb_lower + atr * 0.3,
-          strength: 'Moderat',
-          reason: 'RSI ${rsi.toStringAsFixed(1)} mendekati area oversold. '
-              'Bollinger Band bawah sebagai support volatilitas. '
-              'Potensi reversal jangka pendek.',
-        ));
-      }
-
-      // Entry 3: Pullback ke support
+      // Entry 1: Pullback ke Major Support — ini lokasi yang dinilai gerbang
+      // "Sentuh S&R" pada swing mode.
       if (signal.support.isNotEmpty) {
         final s1 = signal.support.first;
         entries.add(EntryZone(
-          label: 'Entry Konservatif (Pullback)',
+          label: 'Entry Utama (Buy)',
           type: 'BUY',
           priceFrom: s1 - atr * 0.2,
           priceTo: s1 + atr * 0.5,
           strength: 'Kuat',
-          reason: 'Level support historis terkuat. '
-              'Tunggu konfirmasi candle bullish (hammer/engulfing) '
-              'sebelum entry untuk risk yang lebih rendah.',
+          reason: 'Major support \$${s1.toStringAsFixed(2)} dari swing low '
+              'terdahulu — level yang dipakai bot untuk menilai lokasi entry. '
+              'Tunggu Stochastic menyilang ke atas sebagai pelatuk, jangan '
+              'entry hanya karena harga menyentuh level.',
+        ));
+      }
+
+      // Entry 2: BB bawah saat Stochastic oversold.
+      if (bbLower != null && stochK != null && stochK < 30) {
+        entries.add(EntryZone(
+          label: 'Entry Agresif (Buy Dip)',
+          type: 'BUY',
+          priceFrom: bbLower - atr * 0.1,
+          priceTo: bbLower + atr * 0.3,
+          strength: 'Moderat',
+          reason: 'Stochastic %K ${stochK.toStringAsFixed(1)} di area oversold '
+              'dan harga mendekati batas bawah Bollinger Band. '
+              'Potensi reversal jangka pendek — risiko lebih tinggi karena '
+              'belum ada konfirmasi pelatuk.',
         ));
       }
     }
 
     if (isBearish) {
-      // Entry Sell
-      entries.add(EntryZone(
-        label: 'Entry Utama (Sell)',
-        type: 'SELL',
-        priceFrom: ema20 - atr * 0.2,
-        priceTo: ema20 + atr * 0.3,
-        strength: 'Kuat',
-        reason: 'EMA 20 bertindak sebagai resistance dinamis pada tren bearish. '
-            'Sell on rally ke level ini.',
-      ));
-
       if (signal.resistance.isNotEmpty) {
         final r1 = signal.resistance.first;
         entries.add(EntryZone(
-          label: 'Entry Resistance (Sell)',
+          label: 'Entry Utama (Sell)',
           type: 'SELL',
           priceFrom: r1 - atr * 0.3,
           priceTo: r1 + atr * 0.2,
+          strength: 'Kuat',
+          reason: 'Major resistance \$${r1.toStringAsFixed(2)} dari swing high '
+              'terdahulu. Harga cenderung tertolak di area ini. '
+              'Tunggu Stochastic menyilang ke bawah sebagai pelatuk.',
+        ));
+      }
+
+      if (bbUpper != null && stochK != null && stochK > 70) {
+        entries.add(EntryZone(
+          label: 'Entry Agresif (Sell Rally)',
+          type: 'SELL',
+          priceFrom: bbUpper - atr * 0.3,
+          priceTo: bbUpper + atr * 0.1,
           strength: 'Moderat',
-          reason: 'Level resistance historis. Harga cenderung tertolak di area ini. '
-              'Tunggu konfirmasi candle bearish.',
+          reason: 'Stochastic %K ${stochK.toStringAsFixed(1)} di area overbought '
+              'dan harga mendekati batas atas Bollinger Band. '
+              'Sell on rally — belum ada konfirmasi pelatuk.',
         ));
       }
     }
@@ -104,41 +108,41 @@ class TradingAdvisor {
     // ── SUPPORT LEVELS ────────────────────────────────────
     final supports = <TradingLevel>[];
 
-    // Support 1: EMA 20
-    supports.add(TradingLevel(
-      label: 'S1 — EMA 20',
-      price: ema20,
-      type: 'dynamic',
-      reason: 'Support dinamis utama. Selama harga di atas EMA 20, '
-          'tren jangka pendek masih bullish.',
-    ));
-
-    // Support 2: EMA 50
-    supports.add(TradingLevel(
-      label: 'S2 — EMA 50',
-      price: ema50,
-      type: 'dynamic',
-      reason: 'Support menengah yang lebih kuat. Penembusan ke bawah level ini '
-          'mengindikasikan perubahan tren jangka menengah.',
-    ));
-
-    // Support 3: Bollinger Band bawah
-    supports.add(TradingLevel(
-      label: 'S3 — BB Bawah',
-      price: bb_lower,
-      type: 'volatility',
-      reason: 'Batas bawah volatilitas normal. Harga di bawah BB bawah '
-          'mengindikasikan kondisi oversold yang ekstrem.',
-    ));
-
-    // Support historis dari API
-    for (int i = 0; i < signal.support.length && i < 2; i++) {
+    // Support dari swing low (pivot fractal) — inilah level yang dipakai bot.
+    // Versi lama menaruh EMA 20 & EMA 50 sebagai S1/S2; keduanya sudah tidak
+    // dihitung otak, sehingga jatuh ke `cur` dan menampilkan "support" tepat di
+    // harga sekarang — level yang mustahil berguna.
+    for (int i = 0; i < signal.support.length && i < 3; i++) {
       supports.add(TradingLevel(
-        label: 'S${i + 4} — Support Historis',
+        label: 'S${i + 1} — Major Support',
         price: signal.support[i],
         type: 'historical',
-        reason: 'Level support historis berdasarkan swing low terdahulu. '
-            'Area konsentrasi order beli yang kuat.',
+        reason: i == 0
+            ? 'Support terdekat dari swing low terdahulu. Ini level yang dinilai '
+              'bot lewat gerbang "Sentuh S&R" untuk menentukan lokasi entry.'
+            : 'Support historis lapis ${i + 1}. Area konsentrasi order beli '
+              'bila level di atasnya tertembus.',
+      ));
+    }
+
+    // BB bawah sebagai support volatilitas (dinamis, bukan struktural).
+    if (bbLower != null) {
+      supports.add(TradingLevel(
+        label: 'S${supports.length + 1} — BB Bawah',
+        price: bbLower,
+        type: 'volatility',
+        reason: 'Batas bawah volatilitas normal. Harga menembus ke bawah sini '
+            'menandakan kondisi oversold ekstrem.',
+      ));
+    }
+
+    if (supports.isEmpty) {
+      supports.add(TradingLevel(
+        label: 'Belum ada support terdeteksi',
+        price: cur,
+        type: 'none',
+        reason: 'Otak belum menemukan swing low di bawah harga saat ini pada '
+            'timeframe ini. Jangan mengarang level — tunggu struktur terbentuk.',
       ));
     }
 
@@ -180,13 +184,13 @@ class TradingAdvisor {
       }
 
       // Target 3: Bollinger Band atas (jika dalam jangkauan)
-      if (bb_upper > cur && (bb_upper - cur) <= maxRise) {
+      if (bbUpper != null && bbUpper > cur && (bbUpper - cur) <= maxRise) {
         targets.add(TradingLevel(
           label: 'T3 — BB Atas',
-          price: bb_upper,
+          price: bbUpper,
           type: 'volatility',
           reason: 'Batas atas volatilitas normal '
-              '(${((bb_upper - cur) / cur * 100).toStringAsFixed(1)}% di atas). '
+              '(${((bbUpper - cur) / cur * 100).toStringAsFixed(1)}% di atas). '
               'Kondisi overbought. Ideal untuk full take profit.',
         ));
       }
@@ -250,26 +254,18 @@ class TradingAdvisor {
         ));
       }
 
-      // Target 3: EMA 50 (jika di bawah harga dan dalam jangkauan)
-      if (ema50 < cur && (cur - ema50) <= maxDrop) {
-        targets.add(TradingLevel(
-          label: 'T3 — EMA 50',
-          price: ema50,
-          type: 'dynamic',
-          reason: 'EMA 50 sebagai support dinamis menengah '
-              '(${((cur - ema50) / cur * 100).toStringAsFixed(1)}% di bawah). '
-              'Harga sering bouncing di level ini. Take profit 75% posisi.',
-        ));
-      }
+      // Target EMA 50 dihapus — EMA sudah tidak dihitung otak. Struktur S&R
+      // di bawah (T2/T5) sudah mengisi peran "support menengah" ini dengan
+      // level yang benar-benar ada, bukan garis rata-rata.
 
       // Target 4: Bollinger Band bawah HANYA jika dalam jangkauan 8%
-      if (bb_lower < cur && (cur - bb_lower) <= maxDrop) {
+      if (bbLower != null && bbLower < cur && (cur - bbLower) <= maxDrop) {
         targets.add(TradingLevel(
           label: 'T4 — BB Bawah',
-          price: bb_lower,
+          price: bbLower,
           type: 'volatility',
           reason: 'Batas bawah volatilitas normal '
-              '(${((cur - bb_lower) / cur * 100).toStringAsFixed(1)}% di bawah). '
+              '(${((cur - bbLower) / cur * 100).toStringAsFixed(1)}% di bawah). '
               'Indikasikan kondisi oversold. Full take profit di sini.',
         ));
       }
@@ -329,8 +325,7 @@ class TradingAdvisor {
     // ── ARGUMEN & ALASAN ──────────────────────────────────
     final args = _buildArguments(
       price: price, signal: signal, indicators: indicators,
-      rsi: rsi, ema20: ema20, ema50: ema50,
-      isBullish: isBullish, isBearish: isBearish,
+      stochK: stochK, isBullish: isBullish, isBearish: isBearish,
     );
 
     // ── RISK/REWARD ───────────────────────────────────────
@@ -340,9 +335,7 @@ class TradingAdvisor {
 
     // ── SUMMARY ───────────────────────────────────────────
     final summary = _buildSummary(
-      bias: bias, signal: signal.signal,
-      cur: cur, target1d: target1d, rsi: rsi,
-      ema20: ema20, ema50: ema50,
+      bias: bias, signal: signal, cur: cur, target1d: target1d,
     );
 
     return TradingAdvice(
@@ -385,62 +378,66 @@ class TradingAdvisor {
     required GoldPrice price,
     required SignalData signal,
     required IndicatorData indicators,
-    required double rsi, required double ema20, required double ema50,
+    required double? stochK,
     required bool isBullish, required bool isBearish,
   }) {
     final args = <TradingArgument>[];
-    final cur  = price.price;
 
-    // Argumen 1: Tren EMA
-    final emaAbove = cur > ema20 && ema20 > ema50;
+    // Argumen 1: Status gerbang konfluensi — menggantikan "Tren EMA".
+    // EMA sudah tidak dihitung otak; lagipula "harga di atas EMA20" bukan hal
+    // yang dilihat bot saat memutuskan. Yang menentukan: gerbang mana yang lolos.
+    final blocker = signal.blocker;
+    final allPass = signal.gatesTotal > 0 && blocker == null;
     args.add(TradingArgument(
-      icon: '📈',
-      title: 'Tren EMA: ${emaAbove ? "Golden Stack" : "Death Stack"}',
-      description: emaAbove
-          ? 'Harga (\$${cur.toStringAsFixed(0)}) berada di atas EMA 20 '
-            '(\$${ema20.toStringAsFixed(0)}) dan EMA 50 (\$${ema50.toStringAsFixed(0)}). '
-            'Formasi "Golden Stack" mengonfirmasi tren naik jangka pendek-menengah.'
-          : 'Harga berada di bawah EMA 20 atau EMA 50. '
-            'Tren menunjukkan tekanan jual yang dominan. '
-            'Hati-hati entry beli sebelum ada konfirmasi pembalikan.',
-      isBullish: emaAbove,
+      icon: '🚦',
+      title: 'Gerbang Setup (${signal.mode == 'scalping' ? 'Scalping' : 'Swing'}): '
+             '${signal.gatesPassed}/${signal.gatesTotal} lolos',
+      description: allPass
+          ? 'Semua syarat setup terpenuhi. Strateginya rantai AND — semua '
+            'gerbang harus lolos, dan saat ini memang lolos semua. '
+            'Arah: ${signal.direction ?? "-"}.'
+          : blocker == null
+          ? 'Belum ada data gerbang dari otak.'
+          : 'Setup ditahan di gerbang "${blocker.name}" — ${blocker.detail}. '
+            'Selama gerbang ini belum lolos, bot TIDAK akan entry, berapa pun '
+            'meyakinkannya indikator lain.',
+      isBullish: allPass && signal.direction == 'BUY',
     ));
 
-    // Argumen 2: RSI Momentum
-    final rsiStatus = rsi < 30 ? 'Oversold Ekstrem' : rsi < 45 ? 'Oversold Ringan'
-        : rsi > 70 ? 'Overbought Ekstrem' : rsi > 60 ? 'Overbought Ringan' : 'Netral';
-    args.add(TradingArgument(
-      icon: '⚡',
-      title: 'RSI Momentum: $rsiStatus (${rsi.toStringAsFixed(1)})',
-      description: rsi < 30
-          ? 'RSI di bawah 30 menandakan kondisi oversold ekstrem. '
-            'Secara historis, ini area potensial reversal bullish. '
-            'Tunggu konfirmasi candle pembalikan sebelum entry.'
-          : rsi > 70
-          ? 'RSI di atas 70 menandakan kondisi overbought. '
-            'Momentum beli mulai melemah. Pertimbangkan take profit '
-            'atau tunda entry beli baru.'
-          : 'RSI di area ${rsi.toStringAsFixed(0)} menunjukkan momentum '
-            '${rsi > 50 ? "bullish moderat" : "bearish ringan"}. '
-            'Belum ada sinyal ekstrem yang perlu diwaspadai.',
-      isBullish: rsi < 50,
-    ));
+    // Argumen 2: Stochastic — menggantikan "RSI Momentum" (RSI sudah dibuang).
+    if (stochK != null) {
+      final status = stochK < 20 ? 'Oversold' : stochK > 80 ? 'Overbought' : 'Netral';
+      args.add(TradingArgument(
+        icon: '⚡',
+        title: 'Stochastic %K: $status (${stochK.toStringAsFixed(1)})',
+        description: stochK < 20
+            ? 'Stochastic di bawah 20 — area oversold. Tekanan jual mulai '
+              'kehabisan tenaga, tapi oversold saja bukan sinyal beli: '
+              'di tren turun, %K bisa bertahan rendah lama.'
+            : stochK > 80
+            ? 'Stochastic di atas 80 — area overbought. Momentum beli mulai '
+              'jenuh. Pertimbangkan take profit; jangan buka beli baru '
+              'tanpa konfirmasi.'
+            : 'Stochastic di ${stochK.toStringAsFixed(0)} — belum ada kondisi '
+              'jenuh di kedua sisi. Momentum netral.',
+        isBullish: stochK < 20,
+      ));
+    }
 
-    // Argumen 3: Indikator Dominan
-    final buyCount  = signal.buyCount;
-    final sellCount = signal.sellCount;
+    // Argumen 3: Kualitas setup — menggantikan "Konsensus Indikator".
+    // Otak tidak lagi memungut suara, jadi "N Beli vs M Jual" tak punya arti.
     args.add(TradingArgument(
       icon: '🎯',
-      title: 'Konsensus Indikator: $buyCount Beli vs $sellCount Jual',
-      description: buyCount > sellCount
-          ? '$buyCount dari ${buyCount + sellCount + signal.neutralCount} '
-            'indikator teknikal memberikan sinyal BELI. '
-            'Konsensus mayoritas mendukung posisi long (beli). '
-            'Semakin besar selisihnya, semakin kuat sinyal.'
-          : '$sellCount indikator memberikan sinyal JUAL. '
-            'Mayoritas indikator menekan ke sisi bearish. '
-            'Hindari posisi beli melawan tren dominan.',
-      isBullish: buyCount > sellCount,
+      title: 'Kualitas Setup: ${signal.confidence.toStringAsFixed(0)}%',
+      description: signal.direction == null
+          ? 'Belum ada setup yang lolos, jadi belum ada kualitas untuk dinilai. '
+            'Kualitas bukan hasil hitung suara indikator — ia mengukur seberapa '
+            'BAIK tiap syarat dipenuhi setelah semuanya lolos.'
+          : 'Setup ${signal.direction} dengan kualitas '
+            '${signal.confidence.toStringAsFixed(0)}%. Angka ini mengukur '
+            'seberapa baik tiap gerbang dipenuhi — bukan berapa banyak '
+            'indikator yang setuju. Di bawah min_confidence, bot menolak entry.',
+      isBullish: signal.direction == 'BUY',
     ));
 
     // Argumen 4: DXY
@@ -494,19 +491,24 @@ class TradingAdvisor {
       ));
     }
 
-    // Argumen 7: MACD
+    // Argumen 7: MACD — KONTEKS SAJA, bukan gerbang.
+    // MACD sudah dicabut dari kedua rantai gerbang: diuji ke depan ia rugi di
+    // swing (-0.39R) maupun scalping (-0.25R). Sebabnya struktural — ia dan
+    // Stochastic sama-sama osilator momentum dari deret harga yang sama, jadi
+    // menggandengkannya cuma konfirmasi berulang. Tetap ditampilkan sebagai
+    // bacaan pasar, tapi teksnya TIDAK BOLEH menyiratkan bot memakainya.
     final macd = indicators.signals.where((s) => s.name == 'MACD').firstOrNull;
     if (macd != null) {
       args.add(TradingArgument(
         icon: '🔄',
         title: 'MACD: ${macd.signal} (${macd.value.toStringAsFixed(2)})',
-        description: macd.signal == 'BELI'
-            ? 'MACD line di atas signal line dengan histogram positif. '
-              'Ini mengindikasikan momentum bullish yang sedang membangun. '
-              'Konfirmasi kuat untuk posisi beli.'
-            : 'MACD menunjukkan momentum bearish. '
-              'MACD line di bawah signal line mengindikasikan '
-              'tekanan jual yang dominan secara momentum.',
+        description: '${macd.signal == 'BELI'
+            ? 'MACD line di atas signal line dengan histogram positif — '
+                'momentum bullish sedang membangun.'
+            : 'MACD line di bawah signal line — tekanan jual dominan '
+                'secara momentum.'} '
+            'Catatan: bot TIDAK memakai MACD sebagai syarat entry; ini bacaan '
+            'pasar tambahan, bukan gerbang.',
         isBullish: macd.signal == 'BELI',
       ));
     }
@@ -515,21 +517,31 @@ class TradingAdvisor {
   }
 
   static String _buildSummary({
-    required String bias, required String signal,
-    required double cur, required double target1d, required double rsi,
-    required double ema20, required double ema50,
+    required String bias, required SignalData signal,
+    required double cur, required double target1d,
   }) {
     final direction = target1d > cur ? 'naik' : 'turun';
     final chgPct = ((target1d - cur) / cur * 100).abs();
+    final modeLabel = signal.mode == 'scalping' ? 'scalping' : 'swing';
+    final blocker = signal.blocker;
 
-    return 'Berdasarkan analisis ensemble AI dan ${bias == "BULLISH" ? "mayoritas" : "dominasi"} '
-        'indikator teknikal, bias pasar emas hari ini adalah $bias. '
-        'Model prediksi memperkirakan harga berpotensi $direction '
-        '${chgPct.toStringAsFixed(2)}% ke \$${target1d.toStringAsFixed(2)} '
-        'dalam 24 jam ke depan. '
-        'RSI ${rsi.toStringAsFixed(0)} menunjukkan momentum ${rsi > 50 ? "positif" : "negatif"}, '
-        'dengan harga ${cur > ema20 ? "di atas" : "di bawah"} EMA 20 '
-        '(\$${ema20.toStringAsFixed(0)}) sebagai '
-        '${cur > ema20 ? "support" : "resistance"} dinamis kunci.';
+    // Kalimat "mayoritas indikator teknikal" dan bagian RSI/EMA dibuang: otak
+    // tidak lagi memungut suara indikator, dan RSI/EMA sudah tidak dihitung.
+    final setupPart = blocker == null && signal.gatesTotal > 0
+        ? 'Semua ${signal.gatesTotal} gerbang setup $modeLabel lolos '
+          '(kualitas ${signal.confidence.toStringAsFixed(0)}%), arah '
+          '${signal.direction ?? "-"}.'
+        : blocker == null
+        ? 'Data gerbang setup belum tersedia dari otak.'
+        : 'Setup $modeLabel belum terbentuk — '
+          '${signal.gatesPassed}/${signal.gatesTotal} gerbang lolos, '
+          'tertahan di "${blocker.name}". Bot tidak akan entry sampai '
+          'gerbang ini terpenuhi.';
+
+    return 'Bias pasar emas hari ini: $bias. $setupPart '
+        'Terpisah dari itu, model prediksi (LSTM + XGBoost) memperkirakan harga '
+        'berpotensi $direction ${chgPct.toStringAsFixed(2)}% ke '
+        '\$${target1d.toStringAsFixed(2)} dalam 24 jam ke depan — ini proyeksi '
+        'harga, bukan sinyal entry; keputusan entry sepenuhnya dari gerbang.';
   }
 }

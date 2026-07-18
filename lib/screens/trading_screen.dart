@@ -33,13 +33,21 @@ class _TradingScreenState extends State<TradingScreen> {
   bool _toggling = false;
   String? _error;
 
-  String _execMode = 'auto';        // 'auto' | 'selected'
+  // Mode kerja OTAK, bukan mode eksekusi simbol. Berlaku untuk semua simbol —
+  // simbol mana yang ditradingkan ditentukan chart tempat EA dipasang.
+  String _tradingMode = 'swing';    // 'swing' | 'scalping'
+  // Timeframe yang DIEKSEKUSI bot. EA mendorong data SEMUA timeframe (agar layar
+  // analisis memakai harga broker asli), tapi yang ditradingkan hanya yang ini.
+  String _execTf = 'M15';
   bool _savingMode = false;
   BacktestResult? _backtest;
   bool _btLoading = false;
 
   int _maxEntries = 1;              // jumlah entry per simbol
   double _riskPct = 0.5;           // risk % per entry
+  // Ambang kualitas setup (min_confidence di executor). Skala 50-100: dengan
+  // gerbang AND, setup yang lolos SELALU >= 50, jadi 50 = tanpa saringan.
+  double _minConf = 50.0;
   bool _closeOnNeutral = true;     // tutup posisi saat sinyal NETRAL
   bool _closeOnFlip = true;        // tutup posisi saat sinyal berbalik arah
   bool _savingEntry = false;
@@ -113,9 +121,11 @@ class _TradingScreenState extends State<TradingScreen> {
       final s = await _api.getBotSettings();
       if (mounted) {
         setState(() {
-          _execMode = (s['execution_mode'] ?? 'auto').toString();
+          _tradingMode = (s['trading_mode'] ?? 'swing').toString();
+          _execTf = (s['exec_timeframe'] ?? 'M15').toString();
           _maxEntries = (s['max_positions_per_symbol'] ?? 1) as int;
           _riskPct = ((s['risk_percent'] ?? 0.5) as num).toDouble();
+          _minConf = ((s['min_confidence'] ?? 50.0) as num).toDouble();
           _closeOnNeutral = (s['close_on_neutral'] ?? true) as bool;
           _closeOnFlip = (s['close_on_flip'] ?? true) as bool;
         });
@@ -129,6 +139,7 @@ class _TradingScreenState extends State<TradingScreen> {
       final s = await _api.getBotSettings();
       s['max_positions_per_symbol'] = _maxEntries;
       s['risk_percent'] = double.parse(_riskPct.toStringAsFixed(2));
+      s['min_confidence'] = _minConf;
       s['close_on_neutral'] = _closeOnNeutral;
       s['close_on_flip'] = _closeOnFlip;
       await _api.updateBotSettings(s);
@@ -142,15 +153,33 @@ class _TradingScreenState extends State<TradingScreen> {
     }
   }
 
-  Future<void> _setExecMode(String mode) async {
+  Future<void> _setExecTimeframe(String tf) async {
     if (_savingMode) return;
     setState(() => _savingMode = true);
     try {
       final s = await _api.getBotSettings();
-      s['execution_mode'] = mode;
-      s['selected_symbol'] = SymbolState.instance.symbol; // fokus simbol terpilih
+      s['exec_timeframe'] = tf;   // gerbang memakai ini untuk menghitung rencana
       await _api.updateBotSettings(s);
-      if (mounted) setState(() => _execMode = mode);
+      if (mounted) setState(() => _execTf = tf);
+      await _loadStatus();        // /status melaporkan TF eksekusi yang baru
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Gagal ubah timeframe: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _savingMode = false);
+    }
+  }
+
+  Future<void> _setTradingMode(String mode) async {
+    if (_savingMode) return;
+    setState(() => _savingMode = true);
+    try {
+      final s = await _api.getBotSettings();
+      s['trading_mode'] = mode;   // otak memakai ini untuk memilih rantai gerbang
+      await _api.updateBotSettings(s);
+      if (mounted) setState(() => _tradingMode = mode);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -411,6 +440,33 @@ class _TradingScreenState extends State<TradingScreen> {
             style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
           ),
           const Divider(height: 22, color: AppColors.border),
+          const Text('Ambang sinyal',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 11)),
+          const SizedBox(height: 8),
+          _stepperRow(
+            'Kualitas minimum',
+            '${_minConf.toStringAsFixed(0)}%',
+            onMinus: _minConf > 50
+                ? () {
+                    setState(() =>
+                        _minConf = (_minConf - 5).clamp(50.0, 95.0).toDouble());
+                    _saveEntrySettings();
+                  }
+                : null,
+            onPlus: _minConf < 95
+                ? () {
+                    setState(() =>
+                        _minConf = (_minConf + 5).clamp(50.0, 95.0).toDouble());
+                    _saveEntrySettings();
+                  }
+                : null,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            _minConfNote(),
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
+          ),
+          const Divider(height: 22, color: AppColors.border),
           const Text('Cara keluar posisi',
               style: TextStyle(color: AppColors.textSecondary, fontSize: 11)),
           _toggleRow(
@@ -435,6 +491,45 @@ class _TradingScreenState extends State<TradingScreen> {
         ],
       ),
     );
+  }
+
+  /// Penjelasan ambang kualitas — sengaja JUJUR, termasuk saat menaikkannya
+  /// tidak menguntungkan.
+  ///
+  /// Skor kualitas = 50 + 50 x rata-rata skor gerbang, jadi setup yang lolos
+  /// SELALU >= 50 dan "50%" berarti tanpa saringan tambahan.
+  ///
+  /// Yang terukur (emas D1, SL/TP ditelusuri bar demi bar): skor kualitas TIDAK
+  /// memprediksi hasil. Menaikkan ambang di scalping justru memperburuk
+  /// ekspektansi (50%: +0.31R -> 70%: +0.14R -> 75%: -0.05R) sambil memangkas
+  /// 80% peluang. Di swing skor selalu 76-98, jadi ambang di bawah 75 tak
+  /// berefek sama sekali. Sengaja tidak disembunyikan: knob yang tampak berguna
+  /// padahal merugikan itu lebih berbahaya daripada tidak ada knob.
+  String _minConfNote() {
+    final swing = _tradingMode == 'swing';
+    if (_minConf <= 50) {
+      return 'Semua setup yang lolos gerbang diterima. Skor kualitas = 50 + '
+          '50 x rata-rata skor gerbang, jadi setup yang lolos selalu >= 50% — '
+          'ini setelan tanpa saringan tambahan, dan yang terbaik menurut uji.';
+    }
+    if (swing) {
+      return _minConf < 75
+          ? 'Di mode swing skor kualitas hampir selalu 76-98%, jadi ambang '
+              '${_minConf.toStringAsFixed(0)}% praktis TIDAK menyaring apa pun.'
+          : 'Menyaring sedikit setup swing. Perlu diketahui: pada uji, skor '
+              'kualitas tidak memprediksi hasil — menaikkan ambang hanya '
+              'mengurangi peluang tanpa memperbaiki ekspektansi.';
+    }
+    if (_minConf >= 75) {
+      return 'PERINGATAN: pada uji, ambang ${_minConf.toStringAsFixed(0)}% di '
+          'mode scalping membuang ~80% peluang dan ekspektansinya berubah '
+          'NEGATIF (-0.05R vs +0.31R di 50%). Skor tinggi bukan berarti '
+          'peluang lebih baik.';
+    }
+    return 'Menyaring setup scalping berskor rendah. Tapi pada uji hal ini '
+        'MENURUNKAN hasil, bukan menaikkan: 60% -> +0.25R dan 70% -> +0.14R, '
+        'dibanding +0.31R di 50%. Naikkan hanya bila kamu ingin lebih sedikit '
+        'transaksi, bukan untuk mengejar kualitas.';
   }
 
   Widget _toggleRow(String label, String desc, bool value,
@@ -605,12 +700,12 @@ class _TradingScreenState extends State<TradingScreen> {
       );
 
   Widget _execModeCard() {
-    final auto = _execMode == 'auto';
+    final swing = _tradingMode == 'swing';
     Widget opt(String mode, String label, String desc, IconData icon) {
-      final active = _execMode == mode;
+      final active = _tradingMode == mode;
       return Expanded(
         child: InkWell(
-          onTap: _savingMode ? null : () => _setExecMode(mode),
+          onTap: _savingMode ? null : () => _setTradingMode(mode),
           borderRadius: BorderRadius.circular(10),
           child: Container(
             padding: const EdgeInsets.all(12),
@@ -647,7 +742,7 @@ class _TradingScreenState extends State<TradingScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(children: [
-            const Text('Mode Eksekusi',
+            const Text('Mode Kerja Otak',
                 style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
             const Spacer(),
             if (_savingMode)
@@ -656,39 +751,140 @@ class _TradingScreenState extends State<TradingScreen> {
           ]),
           const SizedBox(height: 10),
           Row(children: [
-            opt('auto', 'Otomatis', 'Semua simbol aktif', Icons.all_inclusive),
+            opt('swing', 'Swing', 'Stoch + MACD cross + S&R', Icons.show_chart),
             const SizedBox(width: 10),
-            opt('selected', 'By Selected',
-                'Hanya ${SymbolState.instance.symbol}', Icons.my_location),
+            opt('scalping', 'Scalping', 'Stoch + MACD searah', Icons.bolt),
           ]),
           const SizedBox(height: 8),
           Text(
-            auto
-                ? 'Bot mengeksekusi sinyal untuk semua simbol yang dipantau.'
-                : 'Bot hanya mengeksekusi simbol terpilih: ${SymbolState.instance.symbol}.',
+            swing
+                ? 'Swing: Stochastic cross → MACD cross baru → sentuh Major S&R '
+                  '→ dicek ruang Bollinger. Lebih ketat, entry lebih jarang.'
+                : 'Scalping: Stochastic cross → MACD searah → dicek ruang '
+                  'Bollinger. Tanpa syarat S&R, entry lebih sering.',
             style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
           ),
+          const SizedBox(height: 6),
+          const Text(
+            'Mode berlaku untuk SEMUA simbol. Simbol yang ditradingkan '
+            'ditentukan chart tempat EA dipasang.',
+            style: TextStyle(color: AppColors.textSecondary, fontSize: 10),
+          ),
+
           const Divider(height: 22, color: AppColors.border),
+          // Timeframe EKSEKUSI. EA mendorong data semua timeframe (supaya layar
+          // analisis memakai harga broker asli), tapi hanya SATU yang ditradingkan.
           Row(children: [
             const Icon(Icons.timelapse, size: 16, color: AppColors.textSecondary),
             const SizedBox(width: 8),
-            const Text('Timeframe Sinyal',
+            const Text('Timeframe Eksekusi',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+          ]),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final tf in SymbolState.instance.timeframes)
+                InkWell(
+                  onTap: _savingMode ? null : () => _setExecTimeframe(tf),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: _execTf == tf ? AppColors.goldBg : AppColors.surface2,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                          color: _execTf == tf
+                              ? AppColors.gold
+                              : AppColors.border),
+                    ),
+                    child: Text(tf,
+                        style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: _execTf == tf
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                            color: _execTf == tf
+                                ? AppColors.gold
+                                : AppColors.textSecondary)),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Bot hanya entry di $_execTf. EA tetap mengirim data semua timeframe, '
+            'jadi layar analisis memakai harga broker asli — bukan yfinance.',
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 10),
+          ),
+          const Divider(height: 22, color: AppColors.border),
+          // Yang BENAR-BENAR ditradingkan bot — dilaporkan EA, bukan selektor
+          // timeframe aplikasi. Teks lama ("Bot mengikuti timeframe $_tf")
+          // menyesatkan: selektor itu cuma mengubah apa yang DILIHAT.
+          Row(children: [
+            const Icon(Icons.memory, size: 16, color: AppColors.textSecondary),
+            const SizedBox(width: 8),
+            const Text('Dikerjakan Bot (dari EA)',
                 style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
             const Spacer(),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
                   color: AppColors.goldBg, borderRadius: BorderRadius.circular(8)),
-              child: Text(_tf,
+              child: Text(
+                  (_status?.eaSymbol.isNotEmpty ?? false)
+                      ? '${_status!.eaSymbol} · ${_status!.eaTimeframe}'
+                      : 'menunggu EA…',
                   style: const TextStyle(
                       color: AppColors.gold, fontWeight: FontWeight.bold)),
             ),
           ]),
-          Text('Bot mengikuti timeframe $_tf — ubah dari bar atas.',
-              style: const TextStyle(color: AppColors.textSecondary, fontSize: 11)),
+          const SizedBox(height: 6),
+          if (_botTfMismatch) ...[
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppColors.red.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AppColors.red.withValues(alpha: 0.3)),
+              ),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Icon(Icons.warning_amber_rounded,
+                    size: 15, color: AppColors.red),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Kamu sedang melihat ${SymbolState.instance.symbol} · $_tf, '
+                    'tapi bot entry di ${_status!.eaSymbol} · '
+                    '${_status!.eaTimeframe}. Gerbang di layar analisis TIDAK '
+                    'menggambarkan keputusan bot. Samakan lewat "Timeframe '
+                    'Eksekusi" di atas, atau ubah pilihan di bar atas.',
+                    style: const TextStyle(
+                        color: AppColors.red, fontSize: 11, height: 1.35),
+                  ),
+                ),
+              ]),
+            ),
+          ] else
+            Text(
+              'Timeframe & simbol bot ditentukan input SignalTF pada EA di chart. '
+              'Selektor di bar atas hanya mengubah tampilan.',
+              style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
+            ),
         ],
       ),
     );
+  }
+
+  /// True bila yang sedang dilihat berbeda dari yang dikerjakan bot.
+  bool get _botTfMismatch {
+    final s = _status;
+    if (s == null || s.eaSymbol.isEmpty) return false;
+    return s.eaSymbol.toUpperCase() !=
+            SymbolState.instance.symbol.toUpperCase() ||
+        s.eaTimeframe.toUpperCase() != _tf.toUpperCase();
   }
 
   Widget _backtestCard() {

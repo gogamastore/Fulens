@@ -127,7 +127,8 @@ class ApiService {
       final data = await _get('/api/v1/timeframes');
       return List<String>.from(data['timeframes'] ?? const []);
     } catch (_) {
-      return const ['M15', 'M30', 'H1', 'H4', 'D1', 'W1'];
+      // Fallback bila otak tak terjangkau — samakan dengan brain/timeframes.py.
+      return const ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'];
     }
   }
 
@@ -249,38 +250,91 @@ class GoldPrice {
   );
 }
 
+/// Satu gerbang konfluensi dari otak FuLens.
+///
+/// Menggantikan konsep lama "N indikator memilih beli". Strateginya bukan
+/// pemungutan suara melainkan rantai AND — satu gerbang gagal, tidak ada entry.
+/// Jadi yang berguna ditampilkan bukan hitungan, tapi gerbang mana yang menahan.
+class GateResult {
+  final String name, detail;
+  final bool passed;
+  final double score;          // 0..1, hanya bermakna bila passed
+  /// Gerbang informasional ikut dilaporkan tapi TIDAK memblokir entry
+  /// (mis. divergence saat SWING_USE_DIVERGENCE=false di brain).
+  final bool informational;
+
+  GateResult({
+    required this.name, required this.detail,
+    required this.passed, required this.score,
+    this.informational = false,
+  });
+
+  factory GateResult.fromJson(Map<String, dynamic> j) => GateResult(
+    name          : j['name']   ?? '',
+    detail        : j['detail'] ?? '',
+    passed        : j['passed'] ?? false,
+    score         : (j['score'] ?? 0).toDouble(),
+    informational : j['informational'] ?? false,
+  );
+}
+
+List<GateResult> _gatesFrom(Map<String, dynamic> j) =>
+    List<GateResult>.from((j['gates'] ?? []).map((e) => GateResult.fromJson(e)));
+
 class SignalData {
   final double currentPrice, confidence;
   final String signal, timestamp;
-  final int buyCount, sellCount, neutralCount;
+  /// "scalping" | "swing" — mode strategi yang dipakai brain untuk timeframe ini.
+  final String mode;
+  /// "BUY" | "SELL" | null (tidak ada setup).
+  final String? direction;
+  /// Saat belum ada setup, `gates` adalah diagnosa untuk arah ini — yang paling
+  /// dekat lolos. Bukan berarti indikatornya rusak.
+  final String? probeDirection;
+  final List<GateResult> gates;
+  final List<String> reasons;
   final double? prediction1d, prediction7d;
   final List<double> support, resistance;
 
   SignalData({
     required this.currentPrice, required this.confidence,
     required this.signal, required this.timestamp,
-    required this.buyCount, required this.sellCount,
-    required this.neutralCount,
+    this.mode = 'swing', this.direction, this.probeDirection,
+    this.gates = const [], this.reasons = const [],
     this.prediction1d, this.prediction7d,
     this.support = const [], this.resistance = const [],
   });
 
-  factory SignalData.fromJson(Map<String, dynamic> j) {
-    final sum = j['indicator_summary'] ?? {};
-    return SignalData(
-      currentPrice  : (j['current_price'] ?? 0).toDouble(),
-      confidence    : (j['confidence']    ?? 0).toDouble(),
-      signal        : j['signal'] ?? 'NETRAL',
-      timestamp     : j['timestamp'] ?? '',
-      buyCount      : sum['buy']     ?? 0,
-      sellCount     : sum['sell']    ?? 0,
-      neutralCount  : sum['neutral'] ?? 0,
-      prediction1d  : j['prediction_1d'] != null ? (j['prediction_1d']).toDouble() : null,
-      prediction7d  : j['prediction_7d'] != null ? (j['prediction_7d']).toDouble() : null,
-      support       : List<double>.from((j['support']    ?? []).map((e) => e.toDouble())),
-      resistance    : List<double>.from((j['resistance'] ?? []).map((e) => e.toDouble())),
-    );
+  /// Gerbang yang benar-benar jadi syarat (informasional dikecualikan).
+  List<GateResult> get requiredGates =>
+      gates.where((g) => !g.informational).toList();
+
+  /// Gerbang wajib pertama yang gagal — inilah yang menahan setup.
+  GateResult? get blocker {
+    for (final g in requiredGates) {
+      if (!g.passed) return g;
+    }
+    return null;
   }
+
+  int get gatesPassed => requiredGates.where((g) => g.passed).length;
+  int get gatesTotal  => requiredGates.length;
+
+  factory SignalData.fromJson(Map<String, dynamic> j) => SignalData(
+    currentPrice  : (j['current_price'] ?? 0).toDouble(),
+    confidence    : (j['confidence']    ?? 0).toDouble(),
+    signal        : j['signal'] ?? 'NETRAL',
+    timestamp     : j['timestamp'] ?? '',
+    mode          : j['mode'] ?? 'swing',
+    direction     : j['direction'],
+    probeDirection: j['probe_direction'],
+    gates         : _gatesFrom(j),
+    reasons       : List<String>.from((j['reasons'] ?? []).map((e) => '$e')),
+    prediction1d  : j['prediction_1d'] != null ? (j['prediction_1d']).toDouble() : null,
+    prediction7d  : j['prediction_7d'] != null ? (j['prediction_7d']).toDouble() : null,
+    support       : List<double>.from((j['support']    ?? []).map((e) => e.toDouble())),
+    resistance    : List<double>.from((j['resistance'] ?? []).map((e) => e.toDouble())),
+  );
 }
 
 class PredictionItem {
@@ -357,60 +411,91 @@ class IndicatorSignal {
 }
 
 class IndicatorData {
-  final double currentPrice, confidence;
+  /// Harga BAR YANG DIANALISIS (bar tertutup terakhir) — dasar semua gerbang,
+  /// jadi ini yang benar untuk dibandingkan dengan level S&R.
+  final double currentPrice;
+  /// Harga bar BERJALAN — paling dekat dengan yang tampil di terminal MT5.
+  /// Selalu berbeda dari `currentPrice`; itu wajar, bukan data tak cocok.
+  final double livePrice;
+  final double confidence;
   final String overallSignal, timestamp;
-  final int buyCount, sellCount, neutralCount;
+  final String mode;
+  final String? direction;
+  /// Saat belum ada setup, `gates` adalah diagnosa untuk SATU arah — yang paling
+  /// dekat lolos. Ini menyebut arah mana, supaya checklist tidak disalahartikan
+  /// (dulu selalu BUY, membuat gerbang pertama tampak "selalu menahan").
+  final String? probeDirection;
+  final List<GateResult> gates;
+  /// Nilai mentah komponen (MACD, Stochastic, BB, ATR) — untuk dilihat saja,
+  /// bukan untuk voting. Keputusan sepenuhnya dari `gates`.
   final List<IndicatorSignal> signals;
   final List<double> support, resistance;
 
   IndicatorData({
     required this.currentPrice, required this.confidence,
     required this.overallSignal, required this.timestamp,
-    required this.buyCount, required this.sellCount,
-    required this.neutralCount, required this.signals,
+    required this.signals, this.livePrice = 0,
+    this.mode = 'swing', this.direction, this.probeDirection,
+    this.gates = const [],
     this.support = const [], this.resistance = const [],
   });
 
-  factory IndicatorData.fromJson(Map<String, dynamic> j) {
-    final sum = j['summary'] ?? {};
-    return IndicatorData(
-      currentPrice  : (j['current_price'] ?? 0).toDouble(),
-      confidence    : (j['confidence']    ?? 0).toDouble(),
-      overallSignal : j['overall_signal'] ?? 'NETRAL',
-      timestamp     : j['timestamp']      ?? '',
-      buyCount      : sum['buy']     ?? 0,
-      sellCount     : sum['sell']    ?? 0,
-      neutralCount  : sum['neutral'] ?? 0,
-      signals       : List<IndicatorSignal>.from(
-        (j['signals'] ?? []).map((e) => IndicatorSignal.fromJson(e))),
-      support    : List<double>.from((j['support_levels']    ?? []).map((e) => e.toDouble())),
-      resistance : List<double>.from((j['resistance_levels'] ?? []).map((e) => e.toDouble())),
-    );
+  List<GateResult> get requiredGates =>
+      gates.where((g) => !g.informational).toList();
+
+  GateResult? get blocker {
+    for (final g in requiredGates) {
+      if (!g.passed) return g;
+    }
+    return null;
   }
+
+  int get gatesPassed => requiredGates.where((g) => g.passed).length;
+  int get gatesTotal  => requiredGates.length;
+
+  factory IndicatorData.fromJson(Map<String, dynamic> j) => IndicatorData(
+    currentPrice  : (j['current_price'] ?? 0).toDouble(),
+    livePrice     : (j['live_price'] ?? j['current_price'] ?? 0).toDouble(),
+    confidence    : (j['confidence']    ?? 0).toDouble(),
+    overallSignal : j['overall_signal'] ?? 'NETRAL',
+    timestamp     : j['timestamp']      ?? '',
+    mode          : j['mode'] ?? 'swing',
+    direction     : j['direction'],
+    probeDirection: j['probe_direction'],
+    gates         : _gatesFrom(j),
+    signals       : List<IndicatorSignal>.from(
+      (j['signals'] ?? []).map((e) => IndicatorSignal.fromJson(e))),
+    support    : List<double>.from((j['support_levels']    ?? []).map((e) => e.toDouble())),
+    resistance : List<double>.from((j['resistance_levels'] ?? []).map((e) => e.toDouble())),
+  );
 }
 
 class TimeframeResult {
   final String timeframe, label, signal;
-  final double confidence, rsi, adx;
-  final int buy, sell, neutral;
+  final double confidence;
+  final String? direction;
+  final int gatesPassed, gatesTotal;
+  /// TRUE = data timeframe ini DIKARANG (data harian + noise acak), karena brain
+  /// masih bersumber yfinance harian. Jangan dipakai untuk keputusan — tampilkan
+  /// peringatannya ke pengguna. Hilang setelah EA MQL5 kirim OHLC asli dari MT5.
+  final bool synthetic;
 
   TimeframeResult({
     required this.timeframe, required this.label,
     required this.signal, required this.confidence,
-    required this.rsi, required this.adx,
-    required this.buy, required this.sell, required this.neutral,
+    this.direction, this.gatesPassed = 0, this.gatesTotal = 0,
+    this.synthetic = false,
   });
 
   factory TimeframeResult.fromJson(Map<String, dynamic> j) => TimeframeResult(
-    timeframe  : j['timeframe']  ?? '',
-    label      : j['label']      ?? '',
-    signal     : j['signal']     ?? 'NETRAL',
-    confidence : (j['confidence'] ?? 0).toDouble(),
-    rsi        : (j['rsi']        ?? 0).toDouble(),
-    adx        : (j['adx']        ?? 0).toDouble(),
-    buy        : j['buy']     ?? 0,
-    sell       : j['sell']    ?? 0,
-    neutral    : j['neutral'] ?? 0,
+    timeframe   : j['timeframe']  ?? '',
+    label       : j['label']      ?? '',
+    signal      : j['signal']     ?? 'NETRAL',
+    confidence  : (j['confidence'] ?? 0).toDouble(),
+    direction   : j['direction'],
+    gatesPassed : j['gates_pass']  ?? 0,
+    gatesTotal  : j['gates_total'] ?? 0,
+    synthetic   : j['synthetic']   ?? false,
   );
 }
 
@@ -512,10 +597,15 @@ class BotStatus {
   final bool running, mt5Connected;
   final AccountInfo account;
   final List<String> symbols;
+  /// Simbol & timeframe yang BENAR-BENAR ditradingkan bot — dilaporkan EA
+  /// (chart + input SignalTF). Ini BUKAN selektor timeframe di aplikasi:
+  /// selektor itu hanya mengubah apa yang kamu LIHAT, bukan yang bot kerjakan.
+  final String eaSymbol, eaTimeframe, tradingMode;
 
   BotStatus({
     required this.running, required this.mt5Connected,
     required this.account, this.symbols = const [],
+    this.eaSymbol = '', this.eaTimeframe = '', this.tradingMode = '',
   });
 
   factory BotStatus.fromJson(Map<String, dynamic> j) => BotStatus(
@@ -524,6 +614,9 @@ class BotStatus {
         account: AccountInfo.fromJson(
             (j['account'] as Map<String, dynamic>?) ?? {}),
         symbols: List<String>.from(j['symbols'] ?? const []),
+        eaSymbol: j['ea_symbol'] ?? '',
+        eaTimeframe: j['ea_timeframe'] ?? '',
+        tradingMode: j['trading_mode'] ?? '',
       );
 }
 

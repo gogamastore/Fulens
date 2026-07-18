@@ -11,3 +11,6 @@ executor/logs/
 # Default pabriknya ada di executor/config.py.
 executor/bot_settings.json
 executor/bot_settings.json.tmp
+
+# OHLC yang didorong EA dari terminal MT5 (state runtime per-VPS, bukan kode).
+brain/data/mt5_feed/

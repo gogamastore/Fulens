@@ -167,32 +167,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
         const SizedBox(height: 16),
       ],
 
-      // ── Sinyal Indikator ──
+      // ── Gerbang Setup ──
+      // Dulu di sini ada tiga bar "Beli/Jual/Netral (N indikator)". Itu dibuang:
+      // otak sudah tidak memungut suara, jadi rasio N-indikator tak punya arti
+      // (dan dengan hitungan nol, pembagiannya menghasilkan NaN → bar penuh
+      // semua). Sekarang yang ditampilkan: gerbang mana yang menahan setup.
       if (_signal != null) ...[
-        const SectionLabel('Kekuatan Sinyal'),
+        SectionLabel('Gerbang Setup — ${_signal!.mode == 'scalping' ? 'Scalping' : 'Swing'}'),
         const SizedBox(height: 10),
-        AppCard(child: Column(children: [
-          LabeledProgress(
-            label: 'Beli (${_signal!.buyCount} indikator)',
-            valueLabel: '${(_signal!.buyCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount) * 100).toStringAsFixed(0)}%',
-            value: _signal!.buyCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount),
-            color: AppColors.green,
-          ),
-          const SizedBox(height: 10),
-          LabeledProgress(
-            label: 'Jual (${_signal!.sellCount} indikator)',
-            valueLabel: '${(_signal!.sellCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount) * 100).toStringAsFixed(0)}%',
-            value: _signal!.sellCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount),
-            color: AppColors.red,
-          ),
-          const SizedBox(height: 10),
-          LabeledProgress(
-            label: 'Netral (${_signal!.neutralCount} indikator)',
-            valueLabel: '${(_signal!.neutralCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount) * 100).toStringAsFixed(0)}%',
-            value: _signal!.neutralCount / (_signal!.buyCount + _signal!.sellCount + _signal!.neutralCount),
-            color: AppColors.gold,
-          ),
-        ])),
+        AppCard(child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GateSummaryLine(
+              passed: _signal!.gatesPassed,
+              total: _signal!.gatesTotal,
+              blockerName: _signal!.blocker?.name,
+            ),
+            const SizedBox(height: 6),
+            const Divider(height: 1, color: AppColors.border),
+            const SizedBox(height: 4),
+            GateChecklist(_signal!.gates),
+          ],
+        )),
       ],
       const SizedBox(height: 80),
     ],
